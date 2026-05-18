@@ -1,24 +1,26 @@
 // /client/src/pages/Lobby.jsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   register, login, getProfile, getCatalog, buyUnit, buyItem,
-  getRecentMatches, getQuests, claimQuest, getReplay,
+  getRecentMatches, getQuests, claimQuest, getReplay, getSeason, openSocket, getToken,
 } from "../api";
 import UnitCard from "../components/UnitCard";
 import Quests from "../components/Quests";
 import ReplayViewer from "../components/ReplayViewer";
+import FriendsPanel from "../components/FriendsPanel";
+import Tutorial, { shouldShowTutorial } from "../components/Tutorial";
+import { play, sfx, unlock as audioUnlock, startBGM, getPrefs } from "../audio";
 
 const DIFFICULTIES = [
-  { id: "easy",      label: "Easy",       desc: "5 basic units. Good for warm-ups.", reward: 30,  color: "#22c55e" },
-  { id: "medium",    label: "Medium",     desc: "Balanced team with synergies.",     reward: 60,  color: "#3b82f6" },
-  { id: "hard",      label: "Hard",       desc: "Strong items + 7 units.",           reward: 120, color: "#a855f7" },
-  { id: "nightmare", label: "Nightmare",  desc: "Endgame composition. Brutal.",      reward: 250, color: "#f59e0b" },
+  { id: "easy",      label: "Easy",       desc: "Light comp. Warm up here.",          reward: 30,  color: "#22c55e" },
+  { id: "medium",    label: "Medium",     desc: "Balanced team with synergies.",      reward: 60,  color: "#3b82f6" },
+  { id: "hard",      label: "Hard",       desc: "Items + bigger board, varied comp.", reward: 120, color: "#a855f7" },
+  { id: "nightmare", label: "Nightmare",  desc: "Endgame composition. Brutal.",       reward: 250, color: "#f59e0b" },
 ];
 
 export default function Lobby() {
   const navigate = useNavigate();
-
   const [token, setTokenState] = useState(() => localStorage.getItem("token"));
   const [view, setView] = useState("login");
   const [username, setUsername] = useState("");
@@ -26,29 +28,82 @@ export default function Lobby() {
   const [authError, setAuthError] = useState("");
 
   const [profile, setProfile] = useState(null);
-  const [catalog, setCatalog] = useState({ units: [], traits: {}, items: [] });
+  const [catalog, setCatalog] = useState({ units: [], traits: {}, items: [], augments: [], tiers: [] });
+  const [season, setSeason] = useState(null);
   const [matches, setMatches] = useState([]);
   const [quests, setQuests] = useState([]);
   const [shopMsg, setShopMsg] = useState("");
-  const [tab, setTab] = useState("collection"); // collection | shop | history | quests
-  const [filter, setFilter] = useState(0); // rarity filter for shop, 0 = all
+  const [tab, setTab] = useState("collection");
+  const [filter, setFilter] = useState(0);
   const [replay, setReplay] = useState(null);
+
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [lobbyWs, setLobbyWs] = useState(null);
+  const [incomingInvite, setIncomingInvite] = useState(null);
+  const wsRef = useRef(null);
 
   useEffect(() => {
     if (!token) return;
     refreshAll();
+    if (shouldShowTutorial()) setShowTutorial(true);
+    // Open a lobby WS for friend notifications + invites
+    audioUnlock();
+    const ws = openSocket();
+    wsRef.current = ws;
+    setLobbyWs(ws);
+    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+    ws.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.type === "invite") {
+          play("notify");
+          setIncomingInvite({
+            inviteId: m.inviteId,
+            from: m.from,
+            accept: () => {
+              ws.send(JSON.stringify({ type: "invite_respond", inviteId: m.inviteId, accept: true }));
+              setIncomingInvite(null);
+              navigate("/game", { state: { mode: "pvp", private: true } });
+            },
+            decline: () => {
+              ws.send(JSON.stringify({ type: "invite_respond", inviteId: m.inviteId, accept: false }));
+              setIncomingInvite(null);
+            },
+          });
+        } else if (m.type === "match_found") {
+          // Private invite created a match — jump into game
+          ws.close(); wsRef.current = null;
+          navigate("/game", { state: { mode: "pvp", private: true } });
+          window.location.reload(); // simpler than transferring socket
+        } else if (m.type === "invite_declined") {
+          play("click");
+        }
+      } catch (_) {}
+    };
+    return () => { try { ws.close(); } catch (_) {} };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  // Auto-start BGM after first user interaction (login button click counts)
+  useEffect(() => {
+    if (!token) return;
+    const prefs = getPrefs();
+    if (prefs.music > 0 && !prefs.muted) {
+      const t = setTimeout(() => startBGM(), 600);
+      return () => clearTimeout(t);
+    }
   }, [token]);
 
   async function refreshAll() {
     try {
-      const [c, p, m, q] = await Promise.all([
-        getCatalog(), getProfile(), getRecentMatches(), getQuests(),
+      const [c, p, m, q, s] = await Promise.all([
+        getCatalog(), getProfile(), getRecentMatches(), getQuests(), getSeason(),
       ]);
       setCatalog(c);
       setProfile(p);
       setMatches(m.matches || []);
       setQuests(q.quests || []);
+      setSeason(s.season || null);
     } catch (e) {
       if (e.status === 401) {
         localStorage.removeItem("token");
@@ -57,12 +112,13 @@ export default function Lobby() {
     }
   }
 
-  // ── Auth ──
   async function handleLogin(e) {
     e.preventDefault();
     setAuthError("");
     try {
+      audioUnlock();
       const data = await login(username.trim(), password);
+      play("matchFound");
       setTokenState(data.token);
     } catch (err) { setAuthError(err.message); }
   }
@@ -71,39 +127,47 @@ export default function Lobby() {
     e.preventDefault();
     setAuthError("");
     try {
+      audioUnlock();
       const data = await register(username.trim(), password);
+      play("matchFound");
       setTokenState(data.token);
     } catch (err) { setAuthError(err.message); }
   }
 
-  // ── Shop ──
   async function handleBuyUnit(unit) {
     setShopMsg("");
     try {
-      const r = await buyUnit(unit.id);
+      await buyUnit(unit.id);
+      sfx.pickup();
       setShopMsg(`✓ Bought ${unit.name}!`);
-      setProfile((p) => ({ ...p, user: r.user, units: [...p.units, { ownedId: Date.now(), ...unit }] }));
-      setTimeout(() => setShopMsg(""), 2500);
+      // re-fetch profile authoritatively (no fake ownedId)
+      const fresh = await getProfile();
+      setProfile(fresh);
+      setTimeout(() => setShopMsg(""), 2200);
     } catch (e) { setShopMsg(`✗ ${e.message}`); }
   }
 
   async function handleBuyItem(item) {
     setShopMsg("");
     try {
-      const r = await buyItem(item.id);
+      await buyItem(item.id);
+      sfx.pickup();
       setShopMsg(`✓ Bought ${item.name}!`);
-      setProfile((p) => ({ ...p, user: r.user, items: [...p.items, { ownedId: Date.now(), ...item }] }));
-      setTimeout(() => setShopMsg(""), 2500);
+      const fresh = await getProfile();
+      setProfile(fresh);
+      setTimeout(() => setShopMsg(""), 2200);
     } catch (e) { setShopMsg(`✗ ${e.message}`); }
   }
 
   async function handleClaim(id) {
     try {
-      const r = await claimQuest(id);
-      setProfile((p) => ({ ...p, user: r.user }));
+      await claimQuest(id);
+      sfx.pickup();
+      const fresh = await getProfile();
+      setProfile(fresh);
       const q = await getQuests();
       setQuests(q.quests || []);
-    } catch (e) { /* ignore */ }
+    } catch (_) {}
   }
 
   async function viewReplay(matchId) {
@@ -113,7 +177,12 @@ export default function Lobby() {
     } catch (_) {}
   }
 
-  // ── Auth view ──
+  function inviteToMatch(friend) {
+    if (!wsRef.current || wsRef.current.readyState !== wsRef.current.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: "invite_friend", friendId: friend.id }));
+    play("pickup");
+  }
+
   if (!token) {
     return (
       <div className="page auth-page">
@@ -157,26 +226,35 @@ export default function Lobby() {
     return <div className="page"><div className="spinner" /></div>;
   }
 
-  const user = profile.user;
+  const u = profile.user;
   const ownedUnits = profile.units;
   const ownedItems = profile.items;
-  const ownedCount = (id) => ownedUnits.filter((u) => u.id === id).length;
+  const ownedCount = (id) => ownedUnits.filter((un) => un.id === id).length;
 
-  // ── Authenticated view ──
   return (
     <div className="page lobby-page">
-      {/* Header banner */}
+      {/* Header */}
       <div className="lobby-header">
         <div>
-          <h1 className="lobby-title">Welcome, <span className="lobby-username">{user.username}</span></h1>
+          <h1 className="lobby-title">Welcome, <span className="lobby-username">{u.username}</span></h1>
           <div className="lobby-stats">
-            <span className="stat-pill"><span className="stat-pill-label">MMR</span><span>⭐ {user.mmr}</span></span>
-            <span className="stat-pill"><span className="stat-pill-label">Gold</span><span>🪙 {user.gold}</span></span>
-            <span className="stat-pill"><span className="stat-pill-label">Wins</span><span>🏆 {user.wins}</span></span>
-            <span className="stat-pill"><span className="stat-pill-label">Losses</span><span>💀 {user.losses}</span></span>
-            <span className="stat-pill"><span className="stat-pill-label">Bot Wins</span><span>🤖 {user.bot_wins}</span></span>
+            <span className="stat-pill" style={{ borderColor: u.tier?.color, color: u.tier?.color }}>
+              <span className="stat-pill-label">Tier</span><span>{u.tier?.name || "Bronze"}</span>
+            </span>
+            <span className="stat-pill"><span className="stat-pill-label">MMR</span><span>⭐ {u.mmr}</span></span>
+            <span className="stat-pill"><span className="stat-pill-label">Gold</span><span>🪙 {u.gold}</span></span>
+            <span className="stat-pill"><span className="stat-pill-label">Wins</span><span>🏆 {u.wins}</span></span>
+            <span className="stat-pill"><span className="stat-pill-label">Losses</span><span>💀 {u.losses}</span></span>
+            {u.winstreak >= 2 && <span className="stat-pill" style={{ color: "var(--gold)" }}><span className="stat-pill-label">Streak</span><span>🔥 {u.winstreak}</span></span>}
+            <span className="stat-pill"><span className="stat-pill-label">Bot Wins</span><span>🤖 {u.bot_wins}</span></span>
           </div>
         </div>
+        {season && (
+          <div className="season-pill">
+            <div className="season-name">{season.name}</div>
+            <div className="season-time">{Math.ceil(season.remainingMs / (1000 * 60 * 60 * 24))}d remaining</div>
+          </div>
+        )}
       </div>
 
       {/* Quick play row */}
@@ -185,8 +263,8 @@ export default function Lobby() {
         <div className="play-options">
           <div className="play-option pvp">
             <div className="play-option-title">⚔ Ranked PvP</div>
-            <div className="play-option-desc">Match against another player. +25/-15 MMR.</div>
-            <button className="btn btn-queue" onClick={() => navigate("/game", { state: { mode: "pvp" } })}>
+            <div className="play-option-desc">Match against another player. Adaptive ±MMR with tier-locked K-factor.</div>
+            <button className="btn btn-queue" onClick={() => { sfx.matchFound(); navigate("/game", { state: { mode: "pvp" } }); }}>
               🔍 Find Match
             </button>
           </div>
@@ -196,10 +274,7 @@ export default function Lobby() {
                 <div className="play-option-title" style={{ color: d.color }}>🤖 {d.label}</div>
                 <div className="play-option-desc">{d.desc}</div>
                 <div className="play-option-reward">Win: +🪙 {d.reward}</div>
-                <button
-                  className="btn btn-primary"
-                  onClick={() => navigate("/game", { state: { mode: "pve", difficulty: d.id } })}
-                >
+                <button className="btn btn-primary" onClick={() => navigate("/game", { state: { mode: "pve", difficulty: d.id } })}>
                   Fight
                 </button>
               </div>
@@ -215,6 +290,7 @@ export default function Lobby() {
               <button className={`tab ${tab === "collection" ? "active" : ""}`} onClick={() => setTab("collection")}>🎒 Collection</button>
               <button className={`tab ${tab === "shop" ? "active" : ""}`} onClick={() => setTab("shop")}>🛒 Shop</button>
               <button className={`tab ${tab === "history" ? "active" : ""}`} onClick={() => setTab("history")}>📜 History</button>
+              <button className={`tab ${tab === "friends" ? "active" : ""}`} onClick={() => setTab("friends")}>👥 Friends</button>
             </div>
 
             {shopMsg && <div className="alert alert-info">{shopMsg}</div>}
@@ -222,20 +298,15 @@ export default function Lobby() {
             {tab === "collection" && (
               <div className="tab-body">
                 <h3 className="card-title">Units ({ownedUnits.length})</h3>
-                {ownedUnits.length === 0 ? (
-                  <p>No units yet — visit the shop.</p>
-                ) : (
+                {ownedUnits.length === 0 ? <p>No units yet — visit the shop.</p> : (
                   <div className="unit-grid">
-                    {ownedUnits.map((u, i) => (
-                      <UnitCard key={`${u.ownedId}-${i}`} unit={u} compact ownedCount={ownedCount(u.id)} traitsCatalog={catalog.traits} />
+                    {ownedUnits.map((un, i) => (
+                      <UnitCard key={`${un.ownedId}-${i}`} unit={un} compact ownedCount={ownedCount(un.id)} traitsCatalog={catalog.traits} />
                     ))}
                   </div>
                 )}
-
                 <h3 className="card-title" style={{ marginTop: "1.5rem" }}>Items ({ownedItems.length})</h3>
-                {ownedItems.length === 0 ? (
-                  <p>No items yet — buy from the shop.</p>
-                ) : (
+                {ownedItems.length === 0 ? <p>No items yet — buy from the shop.</p> : (
                   <div className="items-grid">
                     {ownedItems.map((it, i) => (
                       <div key={`${it.ownedId}-${i}`} className="item-card" title={it.desc}>
@@ -261,19 +332,10 @@ export default function Lobby() {
                   ))}
                 </div>
                 <div className="unit-grid">
-                  {catalog.units
-                    .filter((u) => filter === 0 || u.rarity === filter)
-                    .map((u) => (
-                      <UnitCard
-                        key={u.id}
-                        unit={u}
-                        ownedCount={ownedCount(u.id)}
-                        traitsCatalog={catalog.traits}
-                        onBuy={handleBuyUnit}
-                      />
-                    ))}
+                  {catalog.units.filter((un) => filter === 0 || un.rarity === filter).map((un) => (
+                    <UnitCard key={un.id} unit={un} ownedCount={ownedCount(un.id)} traitsCatalog={catalog.traits} onBuy={handleBuyUnit} />
+                  ))}
                 </div>
-
                 <h3 className="card-title" style={{ marginTop: "1.5rem" }}>Items</h3>
                 <div className="items-grid">
                   {catalog.items.map((it) => (
@@ -290,32 +352,35 @@ export default function Lobby() {
 
             {tab === "history" && (
               <div className="tab-body">
-                {matches.length === 0 ? (
-                  <p>No matches played yet.</p>
-                ) : (
+                {matches.length === 0 ? <p>No matches played yet.</p> : (
                   <div className="match-list">
                     {matches.map((m) => {
-                      const won = m.winner_id === user.id;
+                      const won = m.winner_id === u.id;
                       const isBot = !!m.bot_difficulty;
-                      const opponent = isBot
-                        ? `🤖 ${m.bot_difficulty}`
-                        : (m.player1_id === user.id ? m.p2_name : m.p1_name) || "—";
+                      const opponent = isBot ? `🤖 ${m.bot_difficulty}` : (m.player1_id === u.id ? m.p2_name : m.p1_name) || "—";
                       return (
                         <div key={m.id} className={`match-row ${won ? "win" : "loss"}`}>
-                          <span className={`match-result ${won ? "win" : "loss"}`}>
-                            {won ? "WIN" : (m.bot_won ? "LOSS" : "LOSS")}
-                          </span>
+                          <span className={`match-result ${won ? "win" : "loss"}`}>{won ? "WIN" : "LOSS"}</span>
                           <span className="match-vs">vs</span>
                           <span className="match-opp">{opponent}</span>
                           <span className="match-time">{new Date((m.played_at || 0) * 1000).toLocaleString()}</span>
-                          <button className="btn btn-outline match-replay" onClick={() => viewReplay(m.id)}>
-                            ▶ Replay
-                          </button>
+                          <button className="btn btn-outline match-replay" onClick={() => viewReplay(m.id)}>▶ Replay</button>
                         </div>
                       );
                     })}
                   </div>
                 )}
+              </div>
+            )}
+
+            {tab === "friends" && (
+              <div className="tab-body">
+                <FriendsPanel
+                  friendCode={u.friend_code}
+                  onInvite={inviteToMatch}
+                  ws={lobbyWs}
+                  lastInvite={incomingInvite}
+                />
               </div>
             )}
           </div>
@@ -341,6 +406,20 @@ export default function Lobby() {
               ))}
             </div>
           </div>
+
+          {(catalog.tiers || []).length > 0 && (
+            <div className="card glass-card">
+              <h2 className="section-title">🏅 Rank Tiers</h2>
+              <div className="tier-grid">
+                {catalog.tiers.map((t) => (
+                  <div key={t.name} className="tier-row" style={{ borderColor: t.color, color: t.color }}>
+                    <span className="tier-name">{t.name}</span>
+                    <span className="tier-range">{t.min}{t.max < 10000 ? `–${t.max}` : "+"}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -352,6 +431,8 @@ export default function Lobby() {
           onClose={() => setReplay(null)}
         />
       )}
+
+      {showTutorial && <Tutorial onClose={() => setShowTutorial(false)} />}
     </div>
   );
 }

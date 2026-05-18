@@ -136,29 +136,168 @@ const ITEM_BY_ID = {};
 for (const it of ITEMS) ITEM_BY_ID[it.id] = it;
 
 // ─── BOT TEAMS (PvE) ───────────────────────────────────────────────────────
-// Pre-built teams for AI difficulties. Each team uses unit-id refs.
-// Format: array of { unitId, x, y, items?:[itemId] }
+// Each difficulty has multiple variants. Server picks one randomly OR adaptively
+// based on player composition (counter-pick).
 const BOT_TEAMS = {
   easy: [
-    { unitId: 1, x: 1, y: 3 }, { unitId: 5, x: 2, y: 3 }, { unitId: 2, x: 3, y: 3 },
-    { unitId: 4, x: 1, y: 0 }, { unitId: 3, x: 3, y: 0 },
+    [
+      { unitId: 1, x: 1, y: 3 }, { unitId: 5, x: 2, y: 3 }, { unitId: 2, x: 3, y: 3 },
+      { unitId: 4, x: 1, y: 0 }, { unitId: 3, x: 3, y: 0 },
+    ],
+    [
+      { unitId: 1, x: 0, y: 3 }, { unitId: 1, x: 4, y: 3 }, { unitId: 2, x: 2, y: 3 },
+      { unitId: 5, x: 1, y: 3 }, { unitId: 4, x: 3, y: 0 },
+    ],
+    [
+      { unitId: 2, x: 1, y: 3 }, { unitId: 2, x: 3, y: 3 }, { unitId: 7, x: 2, y: 3 },
+      { unitId: 3, x: 0, y: 0 }, { unitId: 3, x: 4, y: 0 },
+    ],
   ],
   medium: [
-    { unitId: 7, x: 1, y: 3 }, { unitId: 6, x: 2, y: 3 }, { unitId: 13, x: 3, y: 3 },
-    { unitId: 8, x: 1, y: 0 }, { unitId: 11, x: 4, y: 0 }, { unitId: 9, x: 0, y: 1 },
+    [
+      { unitId: 7, x: 1, y: 3 }, { unitId: 6, x: 2, y: 3 }, { unitId: 13, x: 3, y: 3 },
+      { unitId: 8, x: 1, y: 0 }, { unitId: 11, x: 4, y: 0 }, { unitId: 9, x: 0, y: 1 },
+    ],
+    [
+      { unitId: 15, x: 2, y: 3 }, { unitId: 2, x: 1, y: 3 }, { unitId: 7, x: 3, y: 3 },
+      { unitId: 5, x: 0, y: 3 }, { unitId: 12, x: 4, y: 3 }, { unitId: 16, x: 2, y: 0 },
+    ],
+    [
+      { unitId: 6, x: 1, y: 3 }, { unitId: 6, x: 3, y: 3 }, { unitId: 13, x: 2, y: 3 },
+      { unitId: 9, x: 0, y: 1 }, { unitId: 18, x: 4, y: 1 },
+    ],
   ],
   hard: [
-    { unitId: 13, x: 2, y: 3 }, { unitId: 22, x: 1, y: 3 }, { unitId: 15, x: 3, y: 3, items: [1, 5] },
-    { unitId: 19, x: 2, y: 2, items: [3] }, { unitId: 14, x: 0, y: 0 }, { unitId: 17, x: 4, y: 0 },
-    { unitId: 18, x: 4, y: 3 },
+    [
+      { unitId: 13, x: 2, y: 3 }, { unitId: 22, x: 1, y: 3 }, { unitId: 15, x: 3, y: 3, items: [1, 5] },
+      { unitId: 19, x: 2, y: 2, items: [3] }, { unitId: 14, x: 0, y: 0 }, { unitId: 17, x: 4, y: 0 },
+      { unitId: 18, x: 4, y: 3 },
+    ],
+    [
+      { unitId: 7, x: 1, y: 3, items: [2] }, { unitId: 13, x: 2, y: 3 }, { unitId: 22, x: 3, y: 3 },
+      { unitId: 8, x: 0, y: 0, items: [4] }, { unitId: 14, x: 4, y: 0, items: [4] },
+      { unitId: 16, x: 2, y: 0 }, { unitId: 17, x: 1, y: 0 },
+    ],
+    [
+      { unitId: 15, x: 2, y: 3, items: [3, 5] }, { unitId: 7, x: 1, y: 3 }, { unitId: 6, x: 3, y: 3 },
+      { unitId: 12, x: 0, y: 3 }, { unitId: 11, x: 4, y: 0 }, { unitId: 16, x: 2, y: 0 },
+      { unitId: 9, x: 4, y: 3 },
+    ],
   ],
   nightmare: [
-    { unitId: 23, x: 2, y: 3, items: [4, 6] }, { unitId: 24, x: 0, y: 3, items: [1, 3] },
-    { unitId: 19, x: 4, y: 3, items: [2] }, { unitId: 22, x: 1, y: 3, items: [5] },
-    { unitId: 20, x: 3, y: 3 }, { unitId: 21, x: 2, y: 2 },
-    { unitId: 14, x: 0, y: 0 }, { unitId: 17, x: 4, y: 0 },
+    [
+      { unitId: 23, x: 2, y: 3, items: [4, 6] }, { unitId: 24, x: 0, y: 3, items: [1, 3] },
+      { unitId: 19, x: 4, y: 3, items: [2] }, { unitId: 22, x: 1, y: 3, items: [5] },
+      { unitId: 20, x: 3, y: 3 }, { unitId: 21, x: 2, y: 2 },
+      { unitId: 14, x: 0, y: 0 }, { unitId: 17, x: 4, y: 0 },
+    ],
+    [
+      { unitId: 19, x: 2, y: 3, items: [1, 3] }, { unitId: 13, x: 1, y: 3, items: [2] },
+      { unitId: 22, x: 3, y: 3, items: [2] }, { unitId: 15, x: 0, y: 3, items: [5] },
+      { unitId: 23, x: 4, y: 3, items: [4] }, { unitId: 17, x: 2, y: 0 },
+      { unitId: 14, x: 0, y: 0 }, { unitId: 8, x: 4, y: 0 },
+    ],
+    [
+      { unitId: 24, x: 2, y: 3, items: [1, 6] }, { unitId: 10, x: 0, y: 3, items: [3] },
+      { unitId: 12, x: 4, y: 3 }, { unitId: 16, x: 2, y: 0, items: [4] },
+      { unitId: 21, x: 1, y: 3 }, { unitId: 20, x: 3, y: 3 },
+      { unitId: 23, x: 0, y: 0, items: [4] }, { unitId: 17, x: 4, y: 0 },
+    ],
   ],
 };
+
+// Pick a bot team for a given difficulty and player board (adaptive).
+// Heuristic: count player traits and pick the variant whose dominant trait
+// counters the player. If no clear counter, pick randomly.
+function pickBotTeam(difficulty, playerBoard, rng = Math.random) {
+  const variants = BOT_TEAMS[difficulty];
+  if (!variants || variants.length === 0) return null;
+  if (!playerBoard || playerBoard.length === 0) {
+    return variants[Math.floor(rng() * variants.length)].slice();
+  }
+
+  // Count player's traits.
+  const playerTraits = {};
+  const seen = new Set();
+  for (const s of playerBoard) {
+    if (seen.has(s.unitId)) continue;
+    seen.add(s.unitId);
+    const u = UNIT_BY_ID[s.unitId];
+    if (!u) continue;
+    for (const t of u.traits) playerTraits[t] = (playerTraits[t] || 0) + 1;
+  }
+
+  // Score each variant by how well it counters.
+  // Preferred counters: Mage→Assassin, Beast→Mage, Knight→Mage, Undead→Holy, Ranger→Assassin
+  const COUNTERS = {
+    Mage: ['Assassin'],
+    Beast: ['Mage', 'Holy'],
+    Knight: ['Mage', 'Elemental'],
+    Undead: ['Holy'],
+    Ranger: ['Assassin', 'Knight'],
+    Assassin: ['Knight'],
+    Holy: ['Beast'],
+    Elemental: ['Knight'],
+  };
+  const desiredCounters = {};
+  for (const [t, count] of Object.entries(playerTraits)) {
+    for (const c of COUNTERS[t] || []) desiredCounters[c] = (desiredCounters[c] || 0) + count;
+  }
+
+  let best = null, bestScore = -Infinity;
+  for (const variant of variants) {
+    const variantTraits = {};
+    const seen2 = new Set();
+    for (const s of variant) {
+      if (seen2.has(s.unitId)) continue;
+      seen2.add(s.unitId);
+      const u = UNIT_BY_ID[s.unitId];
+      if (!u) continue;
+      for (const t of u.traits) variantTraits[t] = (variantTraits[t] || 0) + 1;
+    }
+    let score = 0;
+    for (const [t, c] of Object.entries(variantTraits)) {
+      score += (desiredCounters[t] || 0) * c;
+    }
+    score += rng() * 0.5; // small random tiebreaker
+    if (score > bestScore) { bestScore = score; best = variant; }
+  }
+  return (best || variants[0]).slice();
+}
+
+// ─── AUGMENTS ──────────────────────────────────────────────────────────────
+// Pre-battle buff the player picks from 3 random options. Active for one battle only.
+const AUGMENTS = [
+  { id: 'aug_atk',     name: 'Forged Steel',    emoji: '⚔️', desc: '+15 attack to all units',          apply: { allAttack: 15 } },
+  { id: 'aug_hp',      name: 'Iron Will',       emoji: '🩹', desc: '+150 HP to all units',             apply: { allHp: 150 } },
+  { id: 'aug_atkspd',  name: 'Battle Frenzy',   emoji: '⚡', desc: '+0.20 attack speed to all units',  apply: { allAtkSpeed: 0.20 } },
+  { id: 'aug_mana',    name: 'Mana Surge',      emoji: '🔵', desc: '+30 starting mana for all units',  apply: { allManaStart: 30 } },
+  { id: 'aug_shield',  name: 'Aegis Pact',      emoji: '🛡', desc: '15% damage reduction',             apply: { allShieldPct: 0.15 } },
+  { id: 'aug_crit',    name: 'Lucky Strikes',   emoji: '🎯', desc: '+15% crit chance',                 apply: { allCritChance: 0.15, allCritMul: 1.5 } },
+  { id: 'aug_lifest',  name: 'Vampiric Aura',   emoji: '🩸', desc: '10% lifesteal for all units',      apply: { allLifesteal: 0.10 } },
+  { id: 'aug_dodge',   name: 'Phantom Step',    emoji: '💨', desc: '10% dodge for all units',          apply: { allDodge: 0.10 } },
+  { id: 'aug_spell',   name: 'Arcane Conduit',  emoji: '🔮', desc: '+25% spell power',                 apply: { allSpellMul: 0.25 } },
+  { id: 'aug_gold',    name: 'Coinpurse',       emoji: '🪙', desc: '+50 gold (win or lose)',           apply: { goldBonus: 50 } },
+  { id: 'aug_revive',  name: 'Second Wind',     emoji: '🔁', desc: 'Lowest-cost unit revives once at 30%', apply: { reviveCheapest: true } },
+  { id: 'aug_holy',    name: 'Divine Pulse',    emoji: '✨', desc: '+8 to Holy heal pulses',           apply: { holyPulseBonus: 8 } },
+];
+
+const AUGMENT_BY_ID = {};
+for (const a of AUGMENTS) AUGMENT_BY_ID[a.id] = a;
+
+function rollAugments(rng = Math.random) {
+  const pool = AUGMENTS.slice();
+  const picks = [];
+  while (picks.length < 3 && pool.length > 0) {
+    const idx = Math.floor(rng() * pool.length);
+    picks.push(pool.splice(idx, 1)[0]);
+  }
+  return picks;
+}
+
+// ─── 2-STAR UPGRADE ────────────────────────────────────────────────────────
+// When a player auto-combines 3 of the same unit, the upgraded version uses these multipliers.
+const STAR2_MULT = { hp: 1.8, attack: 1.7, attackSpeed: 1.05 };
 
 const REWARDS = {
   pvp_win:  { gold: 60, mmr:  25 },
@@ -178,6 +317,11 @@ module.exports = {
   ITEMS,
   ITEM_BY_ID,
   BOT_TEAMS,
+  pickBotTeam,
+  AUGMENTS,
+  AUGMENT_BY_ID,
+  rollAugments,
+  STAR2_MULT,
   REWARDS,
   BOARD,
 };

@@ -2,7 +2,7 @@
 // Tick-based auto-battler simulation with traits, items, mana, range targeting.
 // 5 ticks per second; ticks are streamed to client with a small delay.
 
-const { UNIT_BY_ID, TRAITS, ITEM_BY_ID, BOARD } = require('./gamedata');
+const { UNIT_BY_ID, TRAITS, ITEM_BY_ID, BOARD, STAR2_MULT } = require('./gamedata');
 
 const TICKS_PER_SEC = 5;          // 200ms per tick
 const MAX_TICKS = 60 * TICKS_PER_SEC; // hard cap = 60s
@@ -10,10 +10,13 @@ const MANA_PER_HIT_TAKEN = 8;     // gain mana when hit
 const MANA_PER_ATTACK   = 10;     // gain mana when attacking
 
 // Build merged board: team1 placed on rows 0..1, team2 placed mirrored to rows 2..3.
-// Each team's input is an array of { unitId, x, y, items?:[itemId,...] } where y is in 0..1 (their half).
-function placeUnits(team1Slots, team2Slots, traitsActive) {
+// Each team's input is an array of { unitId, x, y, items?:[itemId,...], star?: 2 } where y is in 0..1 (their half).
+// `augments` is { 1: [augObj,...], 2: [...] } applied as initial flat buffs.
+function placeUnits(team1Slots, team2Slots, traitsActive, augments = { 1: [], 2: [] }) {
   const units = [];
   let uid = 0;
+
+  function aug(team) { return augments[team] || []; }
 
   function inst(slot, team) {
     const cat = UNIT_BY_ID[slot.unitId];
@@ -22,11 +25,12 @@ function placeUnits(team1Slots, team2Slots, traitsActive) {
     const y = team === 1 ? slot.y : (BOARD.rows - 1 - slot.y);
     const x = slot.x;
     const items = (slot.items || []).map((id) => ITEM_BY_ID[id]).filter(Boolean);
+    const star = Number(slot.star) === 2 ? 2 : 1;
 
-    // Apply item stat mods
-    let hp = cat.hp;
-    let attack = cat.attack;
-    let attackSpeed = cat.attackSpeed;
+    // Base stats — apply 2-star upgrade multipliers
+    let hp = cat.hp * (star === 2 ? STAR2_MULT.hp : 1);
+    let attack = cat.attack * (star === 2 ? STAR2_MULT.attack : 1);
+    let attackSpeed = cat.attackSpeed * (star === 2 ? STAR2_MULT.attackSpeed : 1);
     let manaStart = cat.manaStart;
     let spellMul = 1;
     let lifesteal = 0;
@@ -49,6 +53,21 @@ function placeUnits(team1Slots, team2Slots, traitsActive) {
       if (s.shieldPct) shieldPct += s.shieldPct;
     }
 
+    // Apply augment effects (per-team)
+    for (const a of aug(team)) {
+      const ap = a.apply || {};
+      if (ap.allHp) hp += ap.allHp;
+      if (ap.allAttack) attack += ap.allAttack;
+      if (ap.allAtkSpeed) attackSpeed += ap.allAtkSpeed;
+      if (ap.allManaStart) manaStart += ap.allManaStart;
+      if (ap.allSpellMul) spellMul += ap.allSpellMul;
+      if (ap.allLifesteal) lifesteal += ap.allLifesteal;
+      if (ap.allDodge) dodge += ap.allDodge;
+      if (ap.allShieldPct) shieldPct += ap.allShieldPct;
+      if (ap.allCritChance) critChance = Math.max(critChance, ap.allCritChance);
+      if (ap.allCritMul) critMul = Math.max(critMul, ap.allCritMul);
+    }
+
     // Apply trait bonuses (resolved per side)
     const t = traitsActive[team] || {};
     if (t.Knight) shieldPct += t.Knight.shieldPct || 0;
@@ -65,9 +84,11 @@ function placeUnits(team1Slots, team2Slots, traitsActive) {
       uid: ++uid,
       team,
       catalogId: cat.id,
-      name: cat.name,
+      name: cat.name + (star === 2 ? ' ★' : ''),
       emoji: cat.emoji,
       traits: cat.traits.slice(),
+      star,
+      cost: cat.cost,
       x, y,
       origX: x, origY: y,
       hp,
@@ -98,6 +119,8 @@ function placeUnits(team1Slots, team2Slots, traitsActive) {
       hasRevived: false,
       items: items.map((i) => ({ id: i.id, name: i.name, emoji: i.emoji })),
       isSummon: false,
+      // tracking for recap
+      damageDealt: 0, damageTaken: 0, healingDone: 0, kills: 0, casts: 0,
     };
   }
 
@@ -108,6 +131,24 @@ function placeUnits(team1Slots, team2Slots, traitsActive) {
   for (const s of team2Slots) {
     const u = inst(s, 2);
     if (u) units.push(u);
+  }
+
+  // Augment: aug_revive — mark cheapest unit per team to revive at 30%
+  for (const team of [1, 2]) {
+    const hasRevive = aug(team).some((a) => a.apply && a.apply.reviveCheapest);
+    if (!hasRevive) continue;
+    const teamUnits = units.filter((u) => u.team === team);
+    if (teamUnits.length === 0) continue;
+    teamUnits.sort((a, b) => (a.cost || 99) - (b.cost || 99));
+    teamUnits[0]._augRevive = true;
+  }
+
+  // Augment: aug_holy — bonus to holy heal pulse (encoded on traitsActive copy)
+  for (const team of [1, 2]) {
+    const holyBonus = aug(team).reduce((acc, a) => acc + ((a.apply && a.apply.holyPulseBonus) || 0), 0);
+    if (holyBonus > 0 && traitsActive[team] && traitsActive[team].Holy) {
+      traitsActive[team].Holy = { ...traitsActive[team].Holy, pulseHeal: (traitsActive[team].Holy.pulseHeal || 0) + holyBonus };
+    }
   }
 
   // Assassin leap: at battle start, jump to back row of enemy
@@ -214,19 +255,30 @@ function takeDamage(target, amount, kind, source, fx, units) {
   }
   target.hp -= dmg;
   fx.push({ t: 'dmg', uid: target.uid, amount: dmg, kind, from: source ? source.uid : null });
+
+  // tracking
+  target.damageTaken = (target.damageTaken || 0) + dmg;
+  if (source) source.damageDealt = (source.damageDealt || 0) + dmg;
+
   // mana from being hit
   if (target.alive) target.mana = Math.min(target.maxMana, target.mana + MANA_PER_HIT_TAKEN);
 
   if (target.hp <= 0) {
     // Phoenix passive
-    if (target.name === 'Phoenix' && !target.hasRevived) {
+    if (target.name.startsWith('Phoenix') && !target.hasRevived) {
       target.hasRevived = true;
       target.hp = Math.floor(target.maxHp * 0.6);
       fx.push({ t: 'revive', uid: target.uid, hp: target.hp });
       return dmg;
     }
+    // Augment cheapest revive
+    if (target._augRevive && !target.hasRevived) {
+      target.hasRevived = true;
+      target.hp = Math.floor(target.maxHp * 0.3);
+      fx.push({ t: 'revive', uid: target.uid, hp: target.hp });
+      return dmg;
+    }
     // Undead trait revive
-    const undead = TRAITS.Undead;
     if (target.traits.includes('Undead') && !target.hasRevived && target._undeadTier) {
       const tier = target._undeadTier;
       if (Math.random() < tier.reviveChance) {
@@ -238,6 +290,7 @@ function takeDamage(target, amount, kind, source, fx, units) {
     }
     target.alive = false;
     target.hp = 0;
+    if (source) source.kills = (source.kills || 0) + 1;
     fx.push({ t: 'death', uid: target.uid });
   }
   return dmg;
@@ -269,6 +322,7 @@ function basicAttack(self, units, fx) {
   if (dealt > 0 && self.lifesteal > 0) {
     const heal = Math.floor(dealt * self.lifesteal);
     self.hp = Math.min(self.maxHp, self.hp + heal);
+    self.healingDone = (self.healingDone || 0) + heal;
     fx.push({ t: 'heal', uid: self.uid, amount: heal });
   }
   // Elemental chain damage from trait
@@ -282,6 +336,7 @@ function basicAttack(self, units, fx) {
 function castSkill(self, units, fx) {
   const team = self.team;
   const sm = self.spellMul;
+  self.casts = (self.casts || 0) + 1;
   fx.push({ t: 'cast', uid: self.uid, name: self.skill });
 
   switch (self.skill) {
@@ -530,23 +585,28 @@ function snapshotUnits(units) {
     shield: u.shield || 0, attack: Math.round(u.attack * (1 + (u.buffAtkPct || 0))),
     alive: u.alive, isSummon: !!u.isSummon, items: u.items || [],
     stun: u.stunTicks > 0, freeze: u.freezeTicks > 0, bleed: u.bleedTicks > 0,
-    traits: u.traits,
+    traits: u.traits, star: u.star || 1,
   }));
 }
 
 function holyPulseHeal(units, team, amount, fx) {
   const a = aliveAllies(units, team).sort((x, y) => x.hp / x.maxHp - y.hp / y.maxHp)[0];
   if (!a) return;
+  const heal = Math.min(amount, a.maxHp - a.hp);
   a.hp = Math.min(a.maxHp, a.hp + amount);
+  if (heal > 0) {
+    a.healingDone = (a.healingDone || 0) + heal; // technically the holy unit healed, not target; close enough for recap
+  }
   fx.push({ t: 'heal', uid: a.uid, amount });
 }
 
-function simulateBattle(team1Slots, team2Slots) {
+function simulateBattle(team1Slots, team2Slots, options = {}) {
+  const augments = options.augments || { 1: [], 2: [] };
   const traitsRes1 = resolveTraits(team1Slots);
   const traitsRes2 = resolveTraits(team2Slots);
   const traitsActive = { 1: traitsRes1.active, 2: traitsRes2.active };
 
-  const units = placeUnits(team1Slots, team2Slots, traitsActive);
+  const units = placeUnits(team1Slots, team2Slots, traitsActive, augments);
 
   // attach undead tier reference and elemental chain
   for (const u of units) {
@@ -634,6 +694,41 @@ function simulateBattle(team1Slots, team2Slots) {
   return {
     ticks, winner, totalTicks: tick,
     traits: { 1: traitsRes1, 2: traitsRes2 },
+    recap: buildRecap(units),
+  };
+}
+
+function buildRecap(units) {
+  const teams = { 1: [], 2: [] };
+  for (const u of units) {
+    if (u.isSummon) continue;
+    teams[u.team].push({
+      uid: u.uid,
+      name: u.name,
+      emoji: u.emoji,
+      catalogId: u.catalogId,
+      damageDealt: Math.floor(u.damageDealt || 0),
+      damageTaken: Math.floor(u.damageTaken || 0),
+      healingDone: Math.floor(u.healingDone || 0),
+      kills: u.kills || 0,
+      casts: u.casts || 0,
+      survived: u.alive,
+      finalHp: Math.max(0, Math.floor(u.hp)),
+      maxHp: u.maxHp,
+    });
+  }
+
+  function pickMvp(arr) {
+    if (arr.length === 0) return null;
+    const sorted = arr.slice().sort((a, b) =>
+      (b.damageDealt + b.healingDone * 1.2 + b.kills * 200) -
+      (a.damageDealt + a.healingDone * 1.2 + a.kills * 200)
+    );
+    return sorted[0].uid;
+  }
+  return {
+    1: { units: teams[1], mvpUid: pickMvp(teams[1]) },
+    2: { units: teams[2], mvpUid: pickMvp(teams[2]) },
   };
 }
 
