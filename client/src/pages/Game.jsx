@@ -1,232 +1,540 @@
-import React, { useState, useEffect, useRef } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
-import Board from "../components/Board";
-import BattleLog from "../components/BattleLog";
+// /client/src/pages/Game.jsx
+// Two modes: PvP (real-time via WebSocket) and PvE (REST one-shot).
 
-const UNITS_CATALOG = [
-  { id: 1, name: "Dragon", emoji: "🐉", cost: 5, hp: 12, attack: 8, speed: 3, skill_name: "Fire Breath", skill_damage: 24 },
-  { id: 2, name: "Knight", emoji: "🗡️", cost: 3, hp: 8, attack: 5, speed: 4, skill_name: "Shield Bash", skill_damage: 0 },
-  { id: 3, name: "Mage", emoji: "🔮", cost: 4, hp: 5, attack: 9, speed: 6, skill_name: "Arcane Blast", skill_damage: 18 },
-  { id: 4, name: "Assassin", emoji: "🗡️", cost: 3, hp: 4, attack: 10, speed: 9, skill_name: "Backstab", skill_damage: 30 },
-  { id: 5, name: "Healer", emoji: "💚", cost: 3, hp: 6, attack: 2, speed: 5, skill_name: "Heal", skill_damage: -5 },
-  { id: 6, name: "Archer", emoji: "🏹", cost: 2, hp: 5, attack: 6, speed: 7, skill_name: "Volley", skill_damage: 4 },
-  { id: 7, name: "Golem", emoji: "🪨", cost: 4, hp: 15, attack: 3, speed: 1, skill_name: "Taunt", skill_damage: 0 },
-  { id: 8, name: "Necromancer", emoji: "💀", cost: 5, hp: 6, attack: 7, speed: 5, skill_name: "Raise Dead", skill_damage: 0 },
-  { id: 9, name: "Valkyrie", emoji: "⚔️", cost: 4, hp: 9, attack: 6, speed: 6, skill_name: "War Cry", skill_damage: 0 },
-  { id: 10, name: "Phoenix", emoji: "🔥", cost: 5, hp: 7, attack: 7, speed: 8, skill_name: "Rebirth", skill_damage: 0 },
-  { id: 11, name: "IceWitch", emoji: "🧊", cost: 4, hp: 6, attack: 7, speed: 6, skill_name: "Freeze", skill_damage: 0 },
-  { id: 12, name: "StormLord", emoji: "🌪️", cost: 5, hp: 8, attack: 6, speed: 7, skill_name: "Storm", skill_damage: 3 },
-];
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import Board, { ROWS } from "../components/Board";
+import BattleArena from "../components/BattleArena";
+import BattleLog from "../components/BattleLog";
+import TraitsPanel from "../components/TraitsPanel";
+import ItemBag from "../components/ItemBag";
+import { getProfile, getCatalog, openSocket, getToken, playBot } from "../api";
+
+const PHASES = {
+  CONNECTING: "connecting",
+  PLACEMENT:  "placement",
+  WAITING:    "waiting",
+  BATTLE:     "battle",
+  RESULT:     "result",
+  ERROR:      "error",
+};
+
+// Compute live trait counts/active for the placed board.
+function computeTraits(boardSlots, unitById, traitsCatalog) {
+  const seen = new Set(); const counts = {};
+  for (const s of boardSlots) {
+    if (seen.has(s.unitId)) continue;
+    seen.add(s.unitId);
+    const u = unitById[s.unitId]; if (!u) continue;
+    for (const tn of u.traits) counts[tn] = (counts[tn] || 0) + 1;
+  }
+  const active = {};
+  for (const [name, c] of Object.entries(counts)) {
+    const def = traitsCatalog[name]; if (!def) continue;
+    let chosen = null;
+    for (const tier of def.tiers) if (c >= tier.count) chosen = tier;
+    if (chosen) active[name] = { ...chosen, count: c };
+  }
+  return { counts, active };
+}
 
 export default function Game() {
-  const location = useLocation();
   const navigate = useNavigate();
-  const wsRef = useRef(null);
+  const location = useLocation();
+  // Modes:
+  // 1) PvE: location.state = { mode: "pve", difficulty }
+  // 2) PvP: location.state = { mode: "pvp" }
+  const mode = location.state?.mode || "pvp";
+  const difficulty = location.state?.difficulty;
 
-  const [phase, setPhase] = useState("connecting");
-  const [myUnits, setMyUnits] = useState([]);
-  const [opponentUnits, setOpponentUnits] = useState([]);
-  const [bench, setBench] = useState([]);
+  const [phase, setPhase] = useState(PHASES.CONNECTING);
+  const [statusMsg, setStatusMsg] = useState("Connecting…");
+  const [errorMsg, setErrorMsg] = useState("");
+
+  const [profile, setProfile] = useState(null);
+  const [catalog, setCatalog] = useState({ units: [], traits: {}, items: [] });
+
+  // placement state — board is array of { unitId, x, y, items: [itemId,...], ownedId, _bk }
+  const [board, setBoard] = useState([]);
+  const [bench, setBench] = useState([]);     // owned units flattened (1 entry per copy)
+  const [items, setItems] = useState([]);     // owned items flattened (1 entry per copy)
   const [selectedBenchIdx, setSelectedBenchIdx] = useState(null);
-  const [battleLog, setBattleLog] = useState([]);
+  const [selectedItemId, setSelectedItemId] = useState(null);
+  const [selectedBoardIdx, setSelectedBoardIdx] = useState(null);
+
+  // PvP state
+  const wsRef = useRef(null);
+  const [matchId, setMatchId] = useState(null);
+  const [side, setSide] = useState(1);
+  const [opponent, setOpponent] = useState(null);
+  const [opponentReady, setOpponentReady] = useState(false);
+  const [placementDeadline, setPlacementDeadline] = useState(null);
+  const [now, setNow] = useState(Date.now());
+
+  // battle state
+  const [units, setUnits] = useState([]);    // current snapshot from server
+  const [fxQueue, setFxQueue] = useState([]);
+  const [tickHistory, setTickHistory] = useState([]); // for log
+  const [battleTraits, setBattleTraits] = useState(null);
+
+  // result state
   const [result, setResult] = useState(null);
-  const [conStatus, setConStatus] = useState("Connecting...");
 
+  const traitsCatalog = catalog.traits || {};
+  const unitById = useMemo(() => {
+    const m = {}; for (const u of catalog.units) m[u.id] = u; return m;
+  }, [catalog]);
+
+  // ── Boot: load profile, catalog, then either PvP socket or PvE direct play ─
   useEffect(() => {
-    let ws;
-    if (location.state?.ws) {
-      ws = location.state.ws;
-      wsRef.current = ws;
-      setConStatus("Connected!");
-      setPhase("placing");
-      const units = location.state.matchData?.units || [];
-      setBench(units.map((u, i) => ({ ...UNITS_CATALOG.find(c => c.id === u), benchIdx: i })));
-    } else {
-      ws = new WebSocket("ws://localhost:3001");
-      wsRef.current = ws;
-      ws.onopen = () => {
-        setConStatus("Connected!");
-        ws.send(JSON.stringify({ type: "join_game" }));
-      };
-      ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === "game_start") {
-          setPhase("placing");
-          setBench((msg.units || msg.myUnits || []).map((u, i) => ({ ...UNITS_CATALOG.find(c => c.id === u), benchIdx: i })));
+    let mounted = true;
+    (async () => {
+      try {
+        const [c, p] = await Promise.all([getCatalog(), getProfile()]);
+        if (!mounted) return;
+        setCatalog(c);
+        setProfile(p);
+        // flatten owned to bench
+        setBench(p.units.map((u) => ({ ...u })));
+        setItems(p.items.map((it) => ({ ...it })));
+
+        if (mode === "pvp") {
+          openPvP();
+        } else {
+          // PvE: skip the WS, go straight to placement
+          setPhase(PHASES.PLACEMENT);
+          setStatusMsg("Build your team and conquer the AI!");
         }
-        handleMessage(msg);
-      };
-      ws.onclose = () => setConStatus("Disconnected");
-      ws.onerror = () => setConStatus("Connection Error");
-    }
-
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      handleMessage(msg);
-    };
-
-    return () => { if (wsRef.current && ws.readyState === WebSocket.OPEN) wsRef.current.close(); };
+      } catch (e) {
+        setErrorMsg(e.message || "Failed to load");
+        setPhase(PHASES.ERROR);
+      }
+    })();
+    return () => { mounted = false; if (wsRef.current) wsRef.current.close(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleMessage = (msg) => {
-    if (msg.type === "matched") {
-      setPhase("placing");
-      const units = msg.units || msg.myUnits || [];
-      setBench(units.map((u, i) => ({ ...UNITS_CATALOG.find(c => c.id === u), benchIdx: i })));
-    } else if (msg.type === "game_start") {
-      setPhase("placing");
-    } else if (msg.type === "your_turn" || msg.type === "placing") {
-      setPhase("placing");
-    } else if (msg.type === "battle_start") {
-      setPhase("battle");
-    } else if (msg.type === "tick" || msg.type === "battle_tick") {
-      const tickEvents = msg.events || [];
-      setBattleLog(prev => [...prev, { tick: msg.tick, events: tickEvents }]);
-      if (msg.myUnits) setMyUnits(msg.myUnits);
-      if (msg.opponentUnits) setOpponentUnits(msg.opponentUnits);
-    } else if (msg.type === "battle_end" || msg.type === "end") {
-      setPhase("ended");
-      setResult({ winner: msg.winner, goldEarned: msg.goldEarned || 0, mmrChange: msg.mmrChange || 0 });
-    } else if (msg.type === "board_placed") {
-      setPhase("ready");
-    } else if (msg.type === "opponent_ready") {
-      // waiting
-    }
-  };
+  // tick clock for placement countdown
+  useEffect(() => {
+    if (!placementDeadline) return;
+    const iv = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(iv);
+  }, [placementDeadline]);
 
-  const handleBoardPlace = (x, y) => {
-    if (selectedBenchIdx === null || phase !== "placing") return;
-    if (myUnits.length >= 5) return;
-    const already = myUnits.find(u => u.x === x && u.y === y);
-    if (already) return;
-    const unit = bench[selectedBenchIdx];
-    if (!unit) return;
-    setMyUnits(prev => [...prev, { ...unit, x, y }]);
+  function openPvP() {
+    const ws = openSocket();
+    wsRef.current = ws;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "auth", token: getToken() }));
+    };
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      handleWS(m);
+    };
+    ws.onclose = () => {
+      if (phase !== PHASES.RESULT) {
+        setStatusMsg("Disconnected from server.");
+      }
+    };
+    ws.onerror = () => setStatusMsg("Connection error.");
+  }
+
+  function handleWS(m) {
+    switch (m.type) {
+      case "hello":
+        setStatusMsg("Connecting…");
+        break;
+      case "auth_ok":
+        setStatusMsg("Searching for opponent…");
+        wsRef.current.send(JSON.stringify({ type: "queue_join" }));
+        break;
+      case "queue_status":
+        setStatusMsg(m.queued ? `Queued (${m.size} waiting)…` : "Left queue.");
+        break;
+      case "match_found": {
+        setMatchId(m.matchId);
+        setSide(m.side);
+        setOpponent(m.opponent);
+        setPlacementDeadline(m.deadline);
+        setPhase(PHASES.PLACEMENT);
+        setStatusMsg(`Battle vs ${m.opponent.username}!`);
+        break;
+      }
+      case "opponent_ready":
+        setOpponentReady(true);
+        break;
+      case "board_ack":
+        setPhase(PHASES.WAITING);
+        break;
+      case "battle_start":
+        setPhase(PHASES.BATTLE);
+        setBattleTraits(m.traits);
+        setTickHistory([]);
+        break;
+      case "tick": {
+        setUnits(m.state || []);
+        setFxQueue(m.fx || []);
+        setTickHistory((cur) => [...cur, { tick: m.tick, fx: m.fx, state: m.state }]);
+        break;
+      }
+      case "battle_end":
+        setPhase(PHASES.RESULT);
+        setResult({ winner: m.winner, youWon: m.youWon, walkover: m.walkover, reward: m.reward, user: m.user });
+        if (m.user) setProfile((p) => ({ ...(p || {}), user: m.user }));
+        break;
+      case "error":
+        setErrorMsg(m.error || "Server error");
+        break;
+      default: break;
+    }
+  }
+
+  // ── Placement helpers ──
+  function placeOnCell(x, absY) {
+    if (selectedBenchIdx === null) return;
+    if (absY >= 2) return; // only player half
+    if (board.length >= 8) return;
+    if (board.find((s) => s.x === x && s.y === absY)) return;
+    const benchUnit = bench[selectedBenchIdx];
+    if (!benchUnit) return;
+    setBoard((cur) => [...cur, { unitId: benchUnit.id, x, y: absY, items: [], ownedId: benchUnit.ownedId }]);
+    // remove from bench
+    setBench((cur) => cur.filter((_, i) => i !== selectedBenchIdx));
     setSelectedBenchIdx(null);
-  };
+  }
 
-  const removeFromBoard = (x, y) => {
-    if (phase !== "placing") return;
-    const unit = myUnits.find(u => u.x === x && u.y === y);
-    if (!unit) return;
-    setMyUnits(prev => prev.filter(u => !(u.x === x && u.y === y)));
-  };
-
-  const submitBoard = () => {
-    if (myUnits.length < 1) return;
-    setPhase("ready");
-    const boardData = myUnits.map(u => ({ catalogId: u.id, x: u.x, y: u.y }));
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "board", action: "ready", board: boardData }));
+  function removeFromBoardAt(x, absY) {
+    const idx = board.findIndex((s) => s.x === x && s.y === absY);
+    if (idx === -1) return;
+    const slot = board[idx];
+    // return unit & items to inventory
+    setBench((cur) => [...cur, { ownedId: slot.ownedId, ...unitById[slot.unitId] }]);
+    if (slot.items?.length > 0) {
+      const restored = slot.items.map((iid) => ({ ownedId: undefined, ...catalog.items.find((it) => it.id === iid) }))
+        .filter(Boolean);
+      setItems((cur) => [...cur, ...restored]);
     }
-  };
+    setBoard((cur) => cur.filter((_, i) => i !== idx));
+    setSelectedBoardIdx(null);
+  }
 
-  const returnToLobby = () => navigate("/");
+  function handleBoardCellClick(x, absY) {
+    // priority: equip selected item to a unit on this cell, else place
+    const occIdx = board.findIndex((s) => s.x === x && s.y === absY);
+    if (selectedItemId !== null && occIdx !== -1) {
+      const slot = board[occIdx];
+      if ((slot.items || []).length >= 2) return;
+      // consume one copy of selectedItemId from items list
+      const itemIdx = items.findIndex((it) => it.id === selectedItemId);
+      if (itemIdx === -1) return;
+      const newItems = items.slice(); newItems.splice(itemIdx, 1); setItems(newItems);
+      const newBoard = board.slice();
+      newBoard[occIdx] = { ...slot, items: [...(slot.items || []), selectedItemId] };
+      setBoard(newBoard);
+      setSelectedItemId(null);
+      return;
+    }
+    if (occIdx !== -1) {
+      // toggle: clicking placed unit removes it
+      removeFromBoardAt(x, absY);
+      return;
+    }
+    if (selectedBenchIdx !== null) {
+      placeOnCell(x, absY);
+    }
+  }
 
-  const unitMap = {};
-  UNITS_CATALOG.forEach(u => { unitMap[u.id] = u; });
+  function resetBoard() {
+    // return all to inventory
+    const restoredUnits = board.map((s) => ({ ownedId: s.ownedId, ...unitById[s.unitId] }));
+    const restoredItems = board.flatMap((s) =>
+      (s.items || []).map((iid) => ({ ownedId: undefined, ...catalog.items.find((it) => it.id === iid) })).filter(Boolean)
+    );
+    setBench((cur) => [...cur, ...restoredUnits]);
+    setItems((cur) => [...cur, ...restoredItems]);
+    setBoard([]);
+    setSelectedBenchIdx(null);
+    setSelectedItemId(null);
+  }
+
+  async function submitBoard() {
+    if (board.length === 0) return;
+    const payload = board.map((s) => ({ unitId: s.unitId, x: s.x, y: s.y, items: s.items || [] }));
+    if (mode === "pvp") {
+      wsRef.current.send(JSON.stringify({ type: "submit_board", matchId, board: payload }));
+      return;
+    }
+    // PvE — call REST then play out replay locally
+    try {
+      setPhase(PHASES.WAITING);
+      setStatusMsg("Battle in progress…");
+      const data = await playBot(difficulty, payload);
+      // Set initial state
+      setBattleTraits(data.replay.traits);
+      setPhase(PHASES.BATTLE);
+      const ticks = data.replay.ticks || [];
+      setTickHistory([]);
+      // Stream ticks locally @ 200ms
+      let i = 0;
+      const step = () => {
+        if (i >= ticks.length) {
+          setPhase(PHASES.RESULT);
+          setResult({
+            winner: data.winner,
+            youWon: data.youWon,
+            reward: data.reward,
+            user: data.user,
+          });
+          return;
+        }
+        const t = ticks[i++];
+        setUnits(t.state || []);
+        setFxQueue(t.fx || []);
+        setTickHistory((cur) => [...cur, { tick: t.tick, fx: t.fx, state: t.state }]);
+        setTimeout(step, 200);
+      };
+      step();
+    } catch (e) {
+      setErrorMsg(e.message || "Battle failed");
+      setPhase(PHASES.ERROR);
+    }
+  }
+
+  function concede() {
+    if (mode === "pvp" && wsRef.current) {
+      wsRef.current.send(JSON.stringify({ type: "concede" }));
+    } else {
+      navigate("/");
+    }
+  }
+
+  function returnToLobby() {
+    if (wsRef.current) wsRef.current.close();
+    navigate("/");
+  }
+
+  // ── Derived ──
+  const liveTraits = useMemo(
+    () => computeTraits(board, unitById, traitsCatalog),
+    [board, unitById, traitsCatalog]
+  );
+
+  // For displaying placement: build "units" array for the Board that mirrors player coords.
+  const placementUnits = useMemo(() => {
+    return board.map((s, i) => {
+      const u = unitById[s.unitId];
+      const itemDescs = (s.items || []).map((iid) => catalog.items.find((it) => it.id === iid)).filter(Boolean);
+      return {
+        uid: -100 - i, // temp negative uid
+        team: 1,
+        catalogId: u.id,
+        name: u.name, emoji: u.emoji, traits: u.traits,
+        x: s.x, y: s.y,
+        hp: u.hp, maxHp: u.hp, mana: u.manaStart, maxMana: u.maxMana,
+        attack: u.attack, alive: true, items: itemDescs.map((it) => ({ id: it.id, name: it.name, emoji: it.emoji })),
+        shield: 0,
+      };
+    });
+  }, [board, unitById, catalog.items]);
+
+  const remainingPlacement = placementDeadline ? Math.max(0, Math.ceil((placementDeadline - now) / 1000)) : null;
+
+  // ── Render ──
+  if (phase === PHASES.ERROR) {
+    return (
+      <div className="page">
+        <h1 className="page-title">⚠️ Error</h1>
+        <p className="alert alert-error">{errorMsg}</p>
+        <button className="btn btn-outline" onClick={returnToLobby}>← Back to Lobby</button>
+      </div>
+    );
+  }
+
+  if (phase === PHASES.CONNECTING || (mode === "pvp" && !matchId)) {
+    return (
+      <div className="page">
+        <h1 className="page-title">⚔️ Battle</h1>
+        <div className="card matchmaking-card">
+          <div className="spinner" />
+          <p className="status-msg">{statusMsg}</p>
+          <button className="btn btn-danger" onClick={returnToLobby}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="page">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
-        <h1 className="page-title">⚔️ Battle Arena</h1>
-        <span className={`badge ${phase === "battle" ? "badge-red" : phase === "ended" ? "badge-gold" : "badge-purple"}`}>
-          {phase.toUpperCase()}
-        </span>
+    <div className="page game-page">
+      {/* Header */}
+      <div className="game-header">
+        <h1 className="page-title">
+          {mode === "pvp" ? "⚔️ Ranked Battle" : `🤖 PvE — ${difficulty?.toUpperCase()}`}
+        </h1>
+        <div className="game-header-meta">
+          {opponent && <span className="badge badge-red">vs {opponent.username} ({opponent.mmr})</span>}
+          {profile?.user && <span className="badge badge-gold">🪙 {profile.user.gold}</span>}
+          <span className={`badge ${phase === PHASES.BATTLE ? "badge-red" : "badge-purple"}`}>
+            {phase.toUpperCase()}
+          </span>
+          {phase === PHASES.PLACEMENT && remainingPlacement !== null && (
+            <span className="badge badge-gold">⏱ {remainingPlacement}s</span>
+          )}
+        </div>
       </div>
 
-      {phase === "connecting" && (
-        <div style={{ textAlign: "center", padding: "3rem" }}>
-          <div className="spinner" />
-          <p>{conStatus}</p>
-        </div>
-      )}
+      {/* PLACEMENT */}
+      {phase === PHASES.PLACEMENT && (
+        <div className="placement-grid">
+          <div className="placement-left">
+            <TraitsPanel
+              counts={liveTraits.counts}
+              active={liveTraits.active}
+              traitsCatalog={traitsCatalog}
+              side={1}
+            />
+          </div>
 
-      {(phase === "placing" || phase === "ready") && (
-        <>
-          <div style={{ display: "flex", gap: "2rem", justifyContent: "center", marginBottom: "1.5rem" }}>
-            <div>
-              <h3 style={{ textAlign: "center", color: "var(--accent-green)", marginBottom: "0.5rem" }}>⭐ Your Board</h3>
-              <Board units={myUnits} isPlayer={true} onPlace={handleBoardPlace} onRemove={removeFromBoard} />
-            </div>
-            <div>
-              <h3 style={{ textAlign: "center", color: "var(--accent-red)", marginBottom: "0.5rem" }}>⚔️ Opponent</h3>
-              <Board units={opponentUnits} isPlayer={false} />
+          <div className="placement-center">
+            <Board
+              units={placementUnits}
+              selfTeam={1}
+              onCellClick={handleBoardCellClick}
+              badge="⚔ Your Side"
+              badgeColor="#a78bfa"
+            />
+            <div className="placement-actions">
+              <button
+                className="btn btn-gold"
+                disabled={board.length === 0}
+                onClick={submitBoard}
+              >
+                ✅ Lock In ({board.length}/8)
+              </button>
+              <button className="btn btn-outline" onClick={resetBoard}>↻ Reset</button>
+              <button className="btn btn-danger" onClick={concede}>🏳 Concede</button>
             </div>
           </div>
 
-          {phase === "placing" && (
-            <>
-              <h3 style={{ color: "var(--gold)", marginBottom: "0.5rem" }}>📦 Bench — Select a unit, then click your board to place</h3>
-              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", justifyContent: "center", marginBottom: "1rem" }}>
-                {bench.map((unit, i) => (
+          <div className="placement-right">
+            <div className="bench-card">
+              <div className="bench-title">🎒 Bench ({bench.length})</div>
+              <div className="bench-grid">
+                {bench.length === 0 && <div className="bench-empty">All units placed.</div>}
+                {bench.map((u, i) => (
                   <div
-                    key={i}
-                    className={`unit-card ${selectedBenchIdx === i ? "selected" : ""}`}
-                    style={{ width: "100px", cursor: "pointer" }}
-                    onClick={() => setSelectedBenchIdx(i)}
+                    key={`${u.ownedId}-${i}`}
+                    className={`bench-slot ${selectedBenchIdx === i ? "selected" : ""}`}
+                    onClick={() => setSelectedBenchIdx(selectedBenchIdx === i ? null : i)}
+                    title={`${u.name} — ${u.skill}`}
                   >
-                    <div className="unit-icon">{unit.emoji}</div>
-                    <div className="unit-name">{unit.name}</div>
-                    <div className="unit-stats">
-                      <span>❤️{unit.hp}</span>
-                      <span>⚔️{unit.attack}</span>
-                      <span>💨{unit.speed}</span>
+                    <div className="bench-emoji">{u.emoji}</div>
+                    <div className="bench-name">{u.name}</div>
+                    <div className="bench-traits">
+                      {u.traits.map((t) => (
+                        <span key={t} className="trait-mini" style={{ color: traitsCatalog[t]?.color }}>
+                          {traitsCatalog[t]?.emoji}
+                        </span>
+                      ))}
                     </div>
                   </div>
                 ))}
               </div>
-
-              <div style={{ display: "flex", gap: "1rem", justifyContent: "center" }}>
-                <button className="btn btn-gold" onClick={submitBoard} disabled={myUnits.length < 1}>
-                  ✅ Ready ({myUnits.length}/5)
-                </button>
-                <button className="btn btn-danger" onClick={() => { setMyUnits([]); setSelectedBenchIdx(null); }}>
-                  🔄 Reset
-                </button>
-              </div>
-            </>
-          )}
-
-          {phase === "ready" && (
-            <div style={{ textAlign: "center", padding: "1rem" }}>
-              <div className="spinner" />
-              <p style={{ color: "var(--gold)" }}>⏳ Waiting for opponent...</p>
             </div>
-          )}
-        </>
-      )}
 
-      {phase === "battle" && (
-        <div style={{ display: "flex", gap: "2rem" }}>
-          <div style={{ flex: 1 }}>
-            <Board units={myUnits} isPlayer={true} />
-          </div>
-          <div style={{ flex: 2 }}>
-            <BattleLog log={battleLog} />
-          </div>
-          <div style={{ flex: 1 }}>
-            <Board units={opponentUnits} isPlayer={false} />
+            <div className="bench-card">
+              <div className="bench-title">💎 Items — click an item, then a placed unit</div>
+              <ItemBag
+                items={items}
+                onSelect={setSelectedItemId}
+                selectedItemId={selectedItemId}
+              />
+            </div>
+
+            <div className="placement-tip">
+              <p>💡 Click a bench unit, then click a cell to place. Click a placed unit to return it. Equip items by selecting an item then clicking a placed unit.</p>
+              {opponentReady && <p className="alert alert-info">⚠️ Opponent is ready!</p>}
+            </div>
           </div>
         </div>
       )}
 
-      {phase === "ended" && result && (
-        <div style={{ textAlign: "center", padding: "3rem" }}>
-          <h2 style={{ fontSize: "2.5rem", color: result.winner === "me" ? "var(--accent-green)" : "var(--accent-red)" }}>
-            {result.winner === "me" ? "🏆 VICTORY!" : "💀 DEFEAT"}
-          </h2>
-          <p style={{ fontSize: "1.2rem", margin: "1rem 0" }}>
-            Gold Earned: <span className="gold-counter">{result.goldEarned}</span>
-          </p>
-          <p style={{ fontSize: "1.2rem", margin: "1rem 0" }}>
-            MMR: <span style={{ color: result.mmrChange >= 0 ? "var(--accent-green)" : "var(--accent-red)" }}>
-              {result.mmrChange >= 0 ? "+" : ""}{result.mmrChange}
-            </span>
-          </p>
-          <button className="btn btn-gold" onClick={returnToLobby} style={{ marginTop: "1rem" }}>
-            🔙 Return to Lobby
-          </button>
+      {/* WAITING */}
+      {phase === PHASES.WAITING && (
+        <div className="card matchmaking-card">
+          <div className="spinner" />
+          <p className="status-msg">⏳ Waiting for battle to start…</p>
+          {opponent && <p>{opponentReady ? `${opponent.username} is ready` : `Waiting for ${opponent.username}…`}</p>}
+        </div>
+      )}
+
+      {/* BATTLE */}
+      {phase === PHASES.BATTLE && (
+        <div className="battle-grid">
+          <div className="battle-side">
+            <TraitsPanel
+              counts={battleTraits?.[side]?.counts || {}}
+              active={battleTraits?.[side]?.active || {}}
+              traitsCatalog={traitsCatalog}
+              side={1}
+            />
+          </div>
+
+          <div className="battle-arena-wrap">
+            <BattleArena
+              units={units}
+              fxQueue={fxQueue}
+              selfTeam={side}
+            />
+            <div style={{ marginTop: 12, display: "flex", justifyContent: "center" }}>
+              <button className="btn btn-danger" onClick={concede}>🏳 Concede</button>
+            </div>
+          </div>
+
+          <div className="battle-side">
+            <TraitsPanel
+              counts={battleTraits?.[side === 1 ? 2 : 1]?.counts || {}}
+              active={battleTraits?.[side === 1 ? 2 : 1]?.active || {}}
+              traitsCatalog={traitsCatalog}
+              side={2}
+            />
+            <BattleLog ticks={tickHistory.slice(-20)} units={units} />
+          </div>
+        </div>
+      )}
+
+      {/* RESULT */}
+      {phase === PHASES.RESULT && result && (
+        <div className="result-modal">
+          <div className={`result-card ${result.youWon ? "victory" : "defeat"}`}>
+            <h1 className="result-title">
+              {result.youWon ? "🏆 VICTORY" : result.walkover ? "🏳 ABANDONED" : "💀 DEFEAT"}
+            </h1>
+            {result.reward && (
+              <div className="result-stats">
+                <div className="result-stat">
+                  <div className="stat-label">Gold Earned</div>
+                  <div className="stat-value gold">+🪙 {result.reward.gold}</div>
+                </div>
+                {result.reward.mmr !== 0 && (
+                  <div className="result-stat">
+                    <div className="stat-label">MMR Change</div>
+                    <div className={`stat-value ${result.reward.mmr >= 0 ? "win" : "lose"}`}>
+                      {result.reward.mmr >= 0 ? "+" : ""}{result.reward.mmr}
+                    </div>
+                  </div>
+                )}
+                {result.user && (
+                  <div className="result-stat">
+                    <div className="stat-label">Total MMR</div>
+                    <div className="stat-value gold">{result.user.mmr}</div>
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: "1rem", marginTop: "1.5rem", justifyContent: "center" }}>
+              <button className="btn btn-gold" onClick={returnToLobby}>← Back to Lobby</button>
+            </div>
+          </div>
         </div>
       )}
     </div>

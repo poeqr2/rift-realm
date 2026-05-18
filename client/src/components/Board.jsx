@@ -1,221 +1,155 @@
-// /root/rift-realm/client/src/components/Board.jsx
+// /client/src/components/Board.jsx
+// 5x4 board. Player half = bottom 2 rows (y=0..1 in player coords).
+// Renders units by uid so React can animate position transitions when the
+// server-side simulation moves a unit.
 
 import React from "react";
 
-const COLS = 5; // A-E
-const ROWS = 2; // 1-2
-const COL_LABELS = ["A", "B", "C", "D", "E"];
+export const COLS = 5;
+export const ROWS = 4;
+export const CELL = 78; // px
 
-function HpBar({ current, max }) {
-  const pct = max > 0 ? Math.min(100, Math.max(0, (current / max) * 100)) : 0;
-  const color = pct > 50 ? "#4ade80" : pct > 25 ? "#facc15" : "#f87171";
+function HpBar({ hp, max, shield = 0 }) {
+  const pct = max > 0 ? Math.max(0, Math.min(100, (hp / max) * 100)) : 0;
+  const color = pct > 60 ? "#22c55e" : pct > 30 ? "#facc15" : "#ef4444";
+  const sPct = max > 0 ? Math.min(100, (shield / max) * 100) : 0;
   return (
-    <div
-      style={{
-        width: "100%",
-        height: "4px",
-        background: "#1f2937",
-        borderRadius: "2px",
-        overflow: "hidden",
-        marginTop: "2px",
-      }}
-    >
-      <div
-        style={{
-          width: `${pct}%`,
-          height: "100%",
-          background: color,
-          borderRadius: "2px",
-          transition: "width 0.4s ease, background 0.4s ease",
-        }}
-      />
+    <div className="hp-track">
+      <div className="hp-fill" style={{ width: `${pct}%`, background: color }} />
+      {shield > 0 && (
+        <div className="hp-shield" style={{ width: `${sPct}%` }} />
+      )}
     </div>
   );
 }
 
-export default function Board({ units = [], isPlayer, onPlace }) {
-  // Build a lookup: "x,y" -> placed unit object
-  const placed = {};
-  units.forEach((entry) => {
-    placed[`${entry.x},${entry.y}`] = entry;
-  });
+function ManaBar({ mana, max }) {
+  if (!max || max >= 999) return null;
+  const pct = Math.max(0, Math.min(100, (mana / max) * 100));
+  return (
+    <div className="mana-track">
+      <div className="mana-fill" style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function StatusIcons({ unit }) {
+  const items = [];
+  if (unit.stun) items.push({ k: "💫", title: "Stunned" });
+  if (unit.freeze) items.push({ k: "❄️", title: "Frozen" });
+  if (unit.bleed) items.push({ k: "🩸", title: "Bleeding" });
+  if (items.length === 0) return null;
+  return (
+    <div className="status-icons">
+      {items.map((it, i) => (
+        <span key={i} title={it.title}>{it.k}</span>
+      ))}
+    </div>
+  );
+}
+
+function ItemDots({ items }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="unit-items">
+      {items.map((it, i) => (
+        <span key={i} title={it.name} className="unit-item-dot">{it.emoji}</span>
+      ))}
+    </div>
+  );
+}
+
+export default function Board({
+  units = [],            // [{ uid, x, y, hp, maxHp, mana, maxMana, name, emoji, team, alive, ... }]
+  selfTeam = 1,          // which team's perspective (controls Y mirror for display)
+  onCellClick,           // (x, y) => void
+  onUnitClick,           // (unit) => void
+  highlightedUid,        // uid of unit currently selected for item-equip
+  badge,                 // text in top-left corner (e.g., "Your Side")
+  badgeColor = "#a78bfa",
+}) {
+  // Server uses absolute y. For display: team1 sits on bottom, team2 on top.
+  // If selfTeam === 1, just render directly. Otherwise vertically flip.
+  function dispY(absY) {
+    return selfTeam === 1 ? absY : (ROWS - 1 - absY);
+  }
+
+  // pre-place units by display position
+  const placedDisp = {};
+  for (const u of units) {
+    if (!u.alive && u.hp <= 0) continue; // dead units get removed
+    const dy = dispY(u.y);
+    placedDisp[`${u.x},${dy}`] = u;
+  }
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: "4px",
-      }}
-    >
-      {/* Board label */}
+    <div className="board-wrap">
+      {badge && (
+        <div className="board-badge" style={{ color: badgeColor, borderColor: badgeColor }}>
+          {badge}
+        </div>
+      )}
       <div
+        className="board-grid"
         style={{
-          textAlign: "center",
-          fontSize: "12px",
-          fontWeight: "bold",
-          color: isPlayer ? "#a78bfa" : "#f87171",
-          letterSpacing: "2px",
-          textTransform: "uppercase",
-          marginBottom: "4px",
+          width: COLS * CELL + (COLS + 1) * 4,
+          height: ROWS * CELL + (ROWS + 1) * 4,
+          ["--cols"]: COLS,
+          ["--rows"]: ROWS,
+          ["--cell"]: `${CELL}px`,
         }}
       >
-        {isPlayer ? "⚔ Your Side" : "☠ Enemy Side"}
-      </div>
-
-      {/* Column headers */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: `repeat(${COLS}, 72px)`,
-          gap: "4px",
-          paddingLeft: "4px",
-        }}
-      >
-        {COL_LABELS.map((label) => (
-          <div
-            key={label}
-            style={{
-              textAlign: "center",
-              fontSize: "10px",
-              color: "#6b7280",
-              fontWeight: "bold",
-            }}
-          >
-            {label}
-          </div>
-        ))}
-      </div>
-
-      {/* Grid rows */}
-      {Array.from({ length: ROWS }, (_, rowIdx) => (
-        <div
-          key={rowIdx}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "4px",
-          }}
-        >
-          {/* Row label */}
-          <div
-            style={{
-              width: "16px",
-              fontSize: "10px",
-              color: "#6b7280",
-              fontWeight: "bold",
-              textAlign: "center",
-              flexShrink: 0,
-            }}
-          >
-            {rowIdx + 1}
-          </div>
-
-          {/* Cells */}
-          {Array.from({ length: COLS }, (_, colIdx) => {
-            const key = `${colIdx},${rowIdx}`;
-            const entry = placed[key];
-            const isEmpty = !entry;
-            const isClickable = isEmpty && !!onPlace;
-
+        {/* cells (background) */}
+        {Array.from({ length: ROWS }, (_, ry) =>
+          Array.from({ length: COLS }, (_, rx) => {
+            const isMyHalf = selfTeam === 1 ? (ry < 2) : (ry < 2);
+            const cellY = ry; // display y
+            const absY = selfTeam === 1 ? cellY : (ROWS - 1 - cellY);
+            const playerHalf = absY < 2;
             return (
               <div
-                key={key}
-                onClick={() => isClickable && onPlace(colIdx, rowIdx)}
+                key={`c-${rx}-${ry}`}
+                className={`cell ${playerHalf ? "my-half" : "enemy-half"}`}
                 style={{
-                  width: "72px",
-                  height: "72px",
-                  background: entry
-                    ? isPlayer
-                      ? "rgba(124, 58, 237, 0.25)"
-                      : "rgba(239, 68, 68, 0.2)"
-                    : "rgba(15, 10, 30, 0.7)",
-                  border: entry
-                    ? isPlayer
-                      ? "1px solid rgba(139, 92, 246, 0.7)"
-                      : "1px solid rgba(239, 68, 68, 0.5)"
-                    : "1px solid rgba(75, 85, 99, 0.4)",
-                  borderRadius: "8px",
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: isClickable ? "pointer" : "default",
-                  transition: "background 0.2s, border-color 0.2s, transform 0.15s",
-                  position: "relative",
-                  boxShadow: entry
-                    ? isPlayer
-                      ? "inset 0 0 12px rgba(139, 92, 246, 0.2)"
-                      : "inset 0 0 12px rgba(239, 68, 68, 0.15)"
-                    : "none",
+                  left: rx * (CELL + 4) + 4,
+                  top: ry * (CELL + 4) + 4,
+                  width: CELL,
+                  height: CELL,
                 }}
-                onMouseEnter={(e) => {
-                  if (isClickable) {
-                    e.currentTarget.style.background = "rgba(124, 58, 237, 0.15)";
-                    e.currentTarget.style.borderColor = "rgba(139, 92, 246, 0.6)";
-                    e.currentTarget.style.transform = "scale(1.04)";
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (isClickable) {
-                    e.currentTarget.style.background = "rgba(15, 10, 30, 0.7)";
-                    e.currentTarget.style.borderColor = "rgba(75, 85, 99, 0.4)";
-                    e.currentTarget.style.transform = "scale(1)";
-                  }
-                }}
-              >
-                {entry ? (
-                  <>
-                    {/* Attack glow animation class applied externally via id */}
-                    <div
-                      id={`cell-${entry.unit?.id ?? key}`}
-                      style={{
-                        fontSize: "28px",
-                        lineHeight: 1,
-                        filter: "drop-shadow(0 0 6px rgba(167, 139, 250, 0.5))",
-                      }}
-                    >
-                      {entry.unit?.emoji ?? "❓"}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: "9px",
-                        color: "#d1d5db",
-                        marginTop: "2px",
-                        maxWidth: "68px",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                        textAlign: "center",
-                      }}
-                    >
-                      {entry.unit?.name}
-                    </div>
-                    <div style={{ width: "90%", marginTop: "2px" }}>
-                      <HpBar
-                        current={entry.currentHp ?? entry.unit?.hp ?? 0}
-                        max={entry.unit?.hp ?? 1}
-                      />
-                    </div>
-                  </>
-                ) : (
-                  isClickable && (
-                    <div
-                      style={{
-                        fontSize: "20px",
-                        color: "rgba(107, 114, 128, 0.4)",
-                        userSelect: "none",
-                      }}
-                    >
-                      +
-                    </div>
-                  )
-                )}
-              </div>
+                onClick={() => onCellClick && onCellClick(rx, absY)}
+              />
             );
-          })}
-        </div>
-      ))}
+          })
+        )}
+
+        {/* units (positioned via uid) */}
+        {Object.entries(placedDisp).map(([key, u]) => {
+          const [x, dy] = key.split(",").map(Number);
+          const myUnit = u.team === selfTeam;
+          const dim = !u.alive ? "dead" : "";
+          return (
+            <div
+              key={u.uid}
+              className={`unit-token ${myUnit ? "my" : "enemy"} ${dim} ${u.uid === highlightedUid ? "highlight" : ""}`}
+              style={{
+                left: x * (CELL + 4) + 4,
+                top: dy * (CELL + 4) + 4,
+                width: CELL,
+                height: CELL,
+              }}
+              data-uid={u.uid}
+              onClick={() => onUnitClick && onUnitClick(u)}
+            >
+              <div className="unit-emoji">{u.emoji}</div>
+              <div className="unit-name-mini">{u.name}</div>
+              <HpBar hp={u.hp} max={u.maxHp} shield={u.shield || 0} />
+              <ManaBar mana={u.mana} max={u.maxMana} />
+              <StatusIcons unit={u} />
+              <ItemDots items={u.items} />
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
