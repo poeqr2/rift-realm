@@ -1,803 +1,995 @@
+// /projects/sandbox/rift-realm/server/server.js
+// Rift Realm — REST API + WebSocket auto-battler.
+// Auth via Bearer header. Persistent sessions stored in DB.
+
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
-const path = require('path');
 
-// ------------------------------------------------------------------
-// DATABASE SETUP
-// ------------------------------------------------------------------
+const {
+  UNITS, UNIT_BY_ID, TRAITS, ITEMS, ITEM_BY_ID,
+  BOT_TEAMS, pickBotTeam, AUGMENTS, AUGMENT_BY_ID, rollAugments,
+  REWARDS, BOARD,
+} = require('./gamedata');
+const { simulateBattle, TICKS_PER_SEC } = require('./battle');
+const { runMigrations } = require('./migrations');
+const { TIERS, tierOf, eloDelta } = require('./ranking');
+const { rateLimitHttp, wsAllow } = require('./rateLimit');
+
+// ─── DB + Migrations ───────────────────────────────────────────────────────
 const db = new Database(path.join(__dirname, 'rift_realm.db'));
 db.pragma('journal_mode = WAL');
+runMigrations(db);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    gold INTEGER DEFAULT 100,
-    mmr INTEGER DEFAULT 1000,
-    wins INTEGER DEFAULT 0,
-    losses INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS units_catalog (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    emoji TEXT NOT NULL,
-    cost INTEGER NOT NULL,
-    hp INTEGER NOT NULL,
-    attack INTEGER NOT NULL,
-    speed INTEGER NOT NULL,
-    skill_name TEXT NOT NULL,
-    skill_damage INTEGER DEFAULT 0,
-    skill_desc TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS user_units (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    unit_id INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    FOREIGN KEY (unit_id) REFERENCES units_catalog(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS matches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player1_id INTEGER NOT NULL,
-    player2_id INTEGER NOT NULL,
-    winner_id INTEGER,
-    replay_data TEXT,
-    played_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (player1_id) REFERENCES users(id),
-    FOREIGN KEY (player2_id) REFERENCES users(id)
-  );
-`);
-
-// ------------------------------------------------------------------
-// SEED THE 12 UNIT CATALOG (only on first run)
-// ------------------------------------------------------------------
-const catalogCount = db.prepare('SELECT COUNT(*) AS c FROM units_catalog').get().c;
-if (catalogCount === 0) {
-  const insertUnit = db.prepare(`
-    INSERT INTO units_catalog (name, emoji, cost, hp, attack, speed, skill_name, skill_damage, skill_desc)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const units = [
-    ['Dragon',      '🐉', 5, 12, 8, 3, 'Fire Breath',   24, '3x damage to a row'],
-    ['Knight',      '🗡️', 3,  8, 5, 4, 'Shield Bash',    5, 'Stuns target for 1 turn'],
-    ['Mage',        '🔮', 4,  5, 9, 6, 'Arcane Blast',  18, '2x damage to lowest HP enemy'],
-    ['Assassin',    '🗡️', 3,  4, 10,9, 'Backstab',      30, '3x damage on a single enemy'],
-    ['Healer',      '💚', 3,  6, 2, 5, 'Heal',           5, 'Heal lowest HP ally for 5'],
-    ['Archer',      '🏹', 2,  5, 6, 7, 'Volley',         4, 'Hits 2 random enemies for 70% atk'],
-    ['Golem',       '🪨', 4, 15, 3, 1, 'Taunt',          0, 'Forces enemies to target self for 1 round'],
-    ['Necromancer', '💀', 5,  6, 7, 5, 'Raise Dead',     0, 'Revives a dead ally with 50% HP'],
-    ['Valkyrie',    '⚔️', 4,  9, 6, 6, 'War Cry',        0, 'Buffs all allies +2 attack for the round'],
-    ['Phoenix',     '🔥', 5,  7, 7, 8, 'Rebirth',        0, 'On death, revives once at 40% HP'],
-    ['IceWitch',    '🧊', 4,  6, 7, 6, 'Freeze',         0, 'Freezes one enemy for 2 turns'],
-    ['StormLord',   '🌪️', 5,  8, 6, 7, 'Storm',          3, 'Damages ALL enemies for 3'],
-  ];
-
-  const seed = db.transaction((rows) => {
-    for (const r of rows) insertUnit.run(...r);
-  });
-  seed(units);
-  console.log('[db] seeded units_catalog with 12 units');
-}
-
-// ------------------------------------------------------------------
-// PREPARED STATEMENTS
-// ------------------------------------------------------------------
-const stmts = {
-  insertUser: db.prepare('INSERT INTO users (username, password) VALUES (?, ?)'),
+// ─── Prepared statements ───────────────────────────────────────────────────
+const Q = {
+  insertUser: db.prepare('INSERT INTO users (username, password, friend_code) VALUES (?, ?, ?)'),
   findUserByName: db.prepare('SELECT * FROM users WHERE username = ?'),
-  findUserById: db.prepare('SELECT * FROM users WHERE id = ?'),
-  publicUser: db.prepare('SELECT id, username, gold, mmr, wins, losses FROM users WHERE id = ?'),
-  updateGold: db.prepare('UPDATE users SET gold = gold - ? WHERE id = ? AND gold >= ?'),
-  addUserUnit: db.prepare('INSERT INTO user_units (user_id, unit_id) VALUES (?, ?)'),
-  myUnits: db.prepare(`
-    SELECT uu.id AS owned_id, c.*
-    FROM user_units uu
-    JOIN units_catalog c ON c.id = uu.unit_id
-    WHERE uu.user_id = ?
+  findUserById:   db.prepare('SELECT * FROM users WHERE id = ?'),
+  findUserByCode: db.prepare('SELECT * FROM users WHERE friend_code = ?'),
+  publicUser: db.prepare(`
+    SELECT id, username, gold, mmr, wins, losses, bot_wins, games_played,
+           peak_mmr, season_id, abandons, abandons_today, abandon_day,
+           winstreak, losestreak, friend_code
+    FROM users WHERE id = ?
   `),
-  catalog: db.prepare('SELECT * FROM units_catalog ORDER BY cost, id'),
-  catalogById: db.prepare('SELECT * FROM units_catalog WHERE id = ?'),
+  spendGold: db.prepare('UPDATE users SET gold = gold - ? WHERE id = ? AND gold >= ?'),
+  addGold:   db.prepare('UPDATE users SET gold = gold + ? WHERE id = ?'),
+  applyMmr:  db.prepare('UPDATE users SET mmr = MAX(0, mmr + ?), peak_mmr = MAX(peak_mmr, mmr + ?) WHERE id = ?'),
+  bumpGames: db.prepare('UPDATE users SET games_played = games_played + 1 WHERE id = ?'),
+  bumpWin:   db.prepare('UPDATE users SET wins = wins + 1, winstreak = winstreak + 1, losestreak = 0 WHERE id = ?'),
+  bumpLoss:  db.prepare('UPDATE users SET losses = losses + 1, losestreak = losestreak + 1, winstreak = 0 WHERE id = ?'),
+  bumpBotWin:db.prepare('UPDATE users SET bot_wins = bot_wins + 1 WHERE id = ?'),
+  setLastLogin: db.prepare('UPDATE users SET last_login = strftime(\'%s\',\'now\') WHERE id = ?'),
+
+  bumpAbandon: db.prepare(`
+    UPDATE users SET abandons = abandons + 1,
+                     abandons_today = CASE WHEN abandon_day = ? THEN abandons_today + 1 ELSE 1 END,
+                     abandon_day = ?
+    WHERE id = ?
+  `),
+
+  addUnit:        db.prepare('INSERT INTO user_units (user_id, unit_id) VALUES (?, ?)'),
+  ownedUnits:     db.prepare('SELECT id, unit_id FROM user_units WHERE user_id = ?'),
+  removeUnitsByOwnedIds: db.prepare(
+    'DELETE FROM user_units WHERE user_id = ? AND id IN (SELECT id FROM user_units WHERE user_id = ? AND unit_id = ? LIMIT ?)'
+  ),
+
+  addItem:    db.prepare('INSERT INTO user_items (user_id, item_id) VALUES (?, ?)'),
+  ownedItems: db.prepare('SELECT id, item_id FROM user_items WHERE user_id = ?'),
+
+  insertSession: db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)'),
+  findSession:   db.prepare('SELECT user_id FROM sessions WHERE token = ?'),
+  deleteSession: db.prepare('DELETE FROM sessions WHERE token = ?'),
+
+  insertMatch: db.prepare(`
+    INSERT INTO matches (player1_id, player2_id, bot_difficulty, winner_id, bot_won, replay_data, replay_token, public)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+  `),
+  recentMatches: db.prepare(`
+    SELECT m.id, m.player1_id, m.player2_id, m.bot_difficulty, m.winner_id, m.bot_won, m.played_at, m.replay_token,
+           u1.username AS p1_name, u2.username AS p2_name
+    FROM matches m
+    LEFT JOIN users u1 ON u1.id = m.player1_id
+    LEFT JOIN users u2 ON u2.id = m.player2_id
+    WHERE m.player1_id = ? OR m.player2_id = ?
+    ORDER BY m.id DESC LIMIT 15
+  `),
+  matchById:        db.prepare('SELECT * FROM matches WHERE id = ?'),
+  matchByToken:     db.prepare('SELECT * FROM matches WHERE replay_token = ?'),
+  setMatchPublic:   db.prepare('UPDATE matches SET public = 1 WHERE id = ? AND (player1_id = ? OR player2_id = ?)'),
+
   leaderboard: db.prepare(`
-    SELECT id, username, mmr, wins, losses
-    FROM users
-    ORDER BY mmr DESC, wins DESC
-    LIMIT 20
+    SELECT id, username, mmr, wins, losses, bot_wins, games_played, peak_mmr
+    FROM users ORDER BY mmr DESC, wins DESC LIMIT 25
   `),
-  recordMatch: db.prepare(`
-    INSERT INTO matches (player1_id, player2_id, winner_id, replay_data)
-    VALUES (?, ?, ?, ?)
+
+  insertQuest: db.prepare(`
+    INSERT INTO quests (user_id, quest_key, progress, target, reward_gold, day)
+    VALUES (?, ?, 0, ?, ?, ?)
   `),
-  applyWin: db.prepare('UPDATE users SET wins = wins + 1, mmr = mmr + 25, gold = gold + 50 WHERE id = ?'),
-  applyLoss: db.prepare('UPDATE users SET losses = losses + 1, mmr = MAX(0, mmr - 15), gold = gold + 15 WHERE id = ?'),
+  questsForDay: db.prepare('SELECT * FROM quests WHERE user_id = ? AND day = ?'),
+  claimQuest:   db.prepare('UPDATE quests SET claimed = 1 WHERE id = ? AND user_id = ? AND completed = 1 AND claimed = 0'),
+  questById:    db.prepare('SELECT * FROM quests WHERE id = ?'),
+
+  // Friends
+  addFriend:        db.prepare('INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?, ?)'),
+  removeFriend:     db.prepare('DELETE FROM friends WHERE user_id = ? AND friend_id = ?'),
+  myFriends:        db.prepare(`
+    SELECT u.id, u.username, u.mmr, u.last_login, u.friend_code
+    FROM friends f JOIN users u ON u.id = f.friend_id WHERE f.user_id = ?
+    ORDER BY u.username
+  `),
+
+  insertFriendReq:  db.prepare('INSERT INTO friend_requests (from_id, to_id) VALUES (?, ?)'),
+  pendingFriendReqs: db.prepare(`
+    SELECT fr.id, fr.from_id, u.username AS from_name, u.mmr AS from_mmr, fr.created_at
+    FROM friend_requests fr JOIN users u ON u.id = fr.from_id
+    WHERE fr.to_id = ? AND fr.status = 'pending' ORDER BY fr.id DESC
+  `),
+  friendReqById:    db.prepare('SELECT * FROM friend_requests WHERE id = ?'),
+  setFriendReqStatus: db.prepare("UPDATE friend_requests SET status = ? WHERE id = ? AND to_id = ? AND status = 'pending'"),
+  existingFriendReq: db.prepare("SELECT id FROM friend_requests WHERE from_id = ? AND to_id = ? AND status = 'pending'"),
+  isFriend:         db.prepare('SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ?'),
+
+  // Loadouts
+  upsertLoadout: db.prepare(`
+    INSERT INTO loadouts (user_id, slot, name, data, updated_at)
+    VALUES (?, ?, ?, ?, strftime('%s','now'))
+    ON CONFLICT(user_id, slot) DO UPDATE SET name = excluded.name, data = excluded.data, updated_at = excluded.updated_at
+  `),
+  loadouts:    db.prepare('SELECT slot, name, data, updated_at FROM loadouts WHERE user_id = ? ORDER BY slot'),
+  delLoadout:  db.prepare('DELETE FROM loadouts WHERE user_id = ? AND slot = ?'),
+
+  // Season
+  currentSeason: db.prepare('SELECT * FROM seasons WHERE archived = 0 ORDER BY id DESC LIMIT 1'),
 };
 
-// ------------------------------------------------------------------
-// TOKEN STORE (simple in-memory)
-// ------------------------------------------------------------------
-const tokens = new Map(); // token -> userId
+// ─── Helpers ───────────────────────────────────────────────────────────────
+function dayKey() {
+  const d = new Date();
+  return Number(`${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`);
+}
 
-function newToken(userId) {
+function genFriendCode(username) {
+  const r = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `${username.slice(0, 4).toUpperCase()}-${r}`;
+}
+
+function ensureDailyQuests(userId) {
+  const day = dayKey();
+  const existing = Q.questsForDay.all(userId, day);
+  if (existing.length >= 3) return existing;
+  const pool = [
+    { key: 'play_3',     target: 3, reward: 50,  desc: 'Play 3 battles' },
+    { key: 'win_2',      target: 2, reward: 100, desc: 'Win 2 battles' },
+    { key: 'bot_hard',   target: 1, reward: 150, desc: 'Beat a Hard or Nightmare bot' },
+    { key: 'place_5',    target: 5, reward: 60,  desc: 'Place 5 different units' },
+    { key: 'use_skill',  target: 5, reward: 70,  desc: 'Cast 5 unit skills' },
+    { key: 'star_up_1',  target: 1, reward: 100, desc: 'Combine to a 2★ unit' },
+  ];
+  const taken = new Set(existing.map((x) => x.quest_key));
+  const candidates = pool.filter((p) => !taken.has(p.key));
+  while (existing.length < 3 && candidates.length > 0) {
+    const idx = Math.floor(Math.random() * candidates.length);
+    const q = candidates.splice(idx, 1)[0];
+    const info = Q.insertQuest.run(userId, q.key, q.target, q.reward, day);
+    existing.push(Q.questById.get(info.lastInsertRowid));
+  }
+  return existing;
+}
+
+function bumpQuestSafely(userId, key, n = 1) {
+  const day = dayKey();
+  const row = db.prepare('SELECT * FROM quests WHERE user_id = ? AND quest_key = ? AND day = ?')
+    .get(userId, key, day);
+  if (!row || row.completed) return;
+  const newProgress = Math.min(row.target, row.progress + n);
+  const completed = newProgress >= row.target ? 1 : 0;
+  db.prepare('UPDATE quests SET progress = ?, completed = ? WHERE id = ?')
+    .run(newProgress, completed, row.id);
+}
+
+function newSession(userId) {
   const t = uuidv4();
-  tokens.set(t, userId);
+  Q.insertSession.run(t, userId);
   return t;
 }
-function authUser(token) {
-  if (!token) return null;
-  const id = tokens.get(token);
-  if (!id) return null;
-  return stmts.findUserById.get(id);
+
+function authFromHeader(req) {
+  const h = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  if (!m) return null;
+  const row = Q.findSession.get(m[1]);
+  if (!row) return null;
+  return Q.findUserById.get(row.user_id);
 }
 
-// ------------------------------------------------------------------
-// EXPRESS APP
-// ------------------------------------------------------------------
+function requireAuth(req, res, next) {
+  const user = authFromHeader(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  req.user = user;
+  next();
+}
+
+function decoratePublicUser(u) {
+  if (!u) return u;
+  const tier = tierOf(u.mmr);
+  return { ...u, tier: { name: tier.name, color: tier.color } };
+}
+
+// Compute streak gold bonus: +10 per consecutive win, capped at +50.
+// Comeback bonus on first win after losestreak >= 3: +30.
+function streakBonus(user, didWin) {
+  if (didWin) {
+    if (user.losestreak >= 3) return 30;          // comeback
+    return Math.min(50, user.winstreak * 10);     // streak (will be applied AFTER bumpWin so winstreak already incremented)
+  }
+  return 0;
+}
+
+// ─── 2-star upgrade resolution ─────────────────────────────────────────────
+// For a player's intended board, look at their full inventory: any time they
+// place 3+ copies of the same unit on the field, automatically mark one slot
+// as star=2 and consume the other two copies for the duration of the battle.
+// Server validation handles ownership; this just rewrites the board.
+function applyStarUpgrades(board, userId) {
+  // Server's authoritative ownership counts.
+  const ownedCounts = {};
+  for (const r of Q.ownedUnits.all(userId)) ownedCounts[r.unit_id] = (ownedCounts[r.unit_id] || 0) + 1;
+
+  // Count placed copies per unitId
+  const placedByUnit = {};
+  for (let i = 0; i < board.length; i++) {
+    const s = board[i];
+    if (!placedByUnit[s.unitId]) placedByUnit[s.unitId] = [];
+    placedByUnit[s.unitId].push(i);
+  }
+
+  let upgrades = 0;
+  const result = board.map((s) => ({ ...s, star: 1 }));
+  for (const [unitId, idxs] of Object.entries(placedByUnit)) {
+    const uid = Number(unitId);
+    if (idxs.length < 3) continue;
+    if ((ownedCounts[uid] || 0) < 3) continue;
+    // Pick the best-positioned copy (closest to enemy front row) as the star
+    idxs.sort((a, b) => result[b].y - result[a].y);
+    const keepIdx = idxs[0];
+    const dropIdxs = idxs.slice(1, 3); // remove 2
+    result[keepIdx].star = 2;
+    // Drop the other two (filter later)
+    for (const di of dropIdxs) result[di]._drop = true;
+    upgrades += 1;
+  }
+  return { board: result.filter((s) => !s._drop), upgrades };
+}
+
+// Validate user board (strict) + apply auto-star upgrades.
+function validateUserBoard(userId, board) {
+  if (!Array.isArray(board) || board.length === 0 || board.length > 8) {
+    return { ok: false, error: 'board must have 1..8 units' };
+  }
+  const ownedCounts = {};
+  for (const r of Q.ownedUnits.all(userId)) ownedCounts[r.unit_id] = (ownedCounts[r.unit_id] || 0) + 1;
+  const ownedItemCounts = {};
+  for (const r of Q.ownedItems.all(userId)) ownedItemCounts[r.item_id] = (ownedItemCounts[r.item_id] || 0) + 1;
+
+  const useUnit = {};
+  const useItem = {};
+  const seen = new Set();
+  const cleaned = [];
+
+  for (const slot of board) {
+    if (!slot || typeof slot !== 'object') return { ok: false, error: 'bad slot' };
+    const unitId = Number(slot.unitId);
+    const x = Number(slot.x), y = Number(slot.y);
+    if (!UNIT_BY_ID[unitId]) return { ok: false, error: 'unknown unit' };
+    if (x < 0 || x >= BOARD.cols) return { ok: false, error: 'x oob' };
+    if (y < 0 || y >= 2) return { ok: false, error: 'y must be in your half' };
+    const key = `${x},${y}`;
+    if (seen.has(key)) return { ok: false, error: 'duplicate cell' };
+    seen.add(key);
+
+    useUnit[unitId] = (useUnit[unitId] || 0) + 1;
+    if (useUnit[unitId] > (ownedCounts[unitId] || 0)) return { ok: false, error: `you don't own enough ${UNIT_BY_ID[unitId].name}` };
+
+    const items = Array.isArray(slot.items) ? slot.items.slice(0, 2).map(Number) : [];
+    for (const iid of items) {
+      if (!ITEM_BY_ID[iid]) return { ok: false, error: 'unknown item' };
+      useItem[iid] = (useItem[iid] || 0) + 1;
+      if (useItem[iid] > (ownedItemCounts[iid] || 0)) return { ok: false, error: 'item overuse' };
+    }
+
+    cleaned.push({ unitId, x, y, items });
+  }
+
+  // Apply auto 2-star upgrades
+  const upgraded = applyStarUpgrades(cleaned, userId);
+  return { ok: true, board: upgraded.board, upgrades: upgraded.upgrades };
+}
+
+// ─── App ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// --- AUTH ---
-app.post('/api/register', (req, res) => {
+// Generic per-IP rate limit: 600/min, burst 60.
+app.use(rateLimitHttp({ capacity: 60, refillPerSec: 10, prefix: 'global' }));
+const authLimiter = rateLimitHttp({ capacity: 8, refillPerSec: 0.2, prefix: 'auth' }); // 8 burst, ~12/min
+const shopLimiter = rateLimitHttp({ capacity: 12, refillPerSec: 0.5, prefix: 'shop' }); // ~30/min
+const playLimiter = rateLimitHttp({ capacity: 6,  refillPerSec: 0.2, prefix: 'play' }); // ~12/min
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
+app.post('/api/register', authLimiter, (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ success: false, error: 'username and password required' });
-  if (username.length < 3 || password.length < 3) return res.status(400).json({ success: false, error: 'username/password too short' });
+  if (!username || !password) return res.status(400).json({ error: 'username/password required' });
+  if (username.length < 3 || password.length < 3) return res.status(400).json({ error: 'too short' });
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: 'username: letters/numbers/_ only' });
+  if (Q.findUserByName.get(username)) return res.status(409).json({ error: 'username taken' });
 
-  if (stmts.findUserByName.get(username)) {
-    return res.status(409).json({ success: false, error: 'username taken' });
-  }
   const hash = bcrypt.hashSync(password, 8);
-  const info = stmts.insertUser.run(username, hash);
-  const user = stmts.publicUser.get(info.lastInsertRowid);
+  // generate friend code with retry on collision
+  let fc; for (let i = 0; i < 5; i++) { fc = genFriendCode(username); if (!Q.findUserByCode.get(fc)) break; }
+  const info = Q.insertUser.run(username, hash, fc);
 
-  // Starter pack: give a couple of cheap units
-  stmts.addUserUnit.run(user.id, 6); // Archer
-  stmts.addUserUnit.run(user.id, 2); // Knight
+  const starters = [1, 2, 3, 4, 5];
+  for (const id of starters) Q.addUnit.run(info.lastInsertRowid, id);
+  Q.addItem.run(info.lastInsertRowid, 1);
 
-  const token = newToken(user.id);
-  res.json({ success: true, token, user });
+  Q.setLastLogin.run(info.lastInsertRowid);
+  const token = newSession(info.lastInsertRowid);
+  const user = decoratePublicUser(Q.publicUser.get(info.lastInsertRowid));
+  res.json({ token, user });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', authLimiter, (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ success: false, error: 'username and password required' });
-
-  const row = stmts.findUserByName.get(username);
+  if (!username || !password) return res.status(400).json({ error: 'username/password required' });
+  const row = Q.findUserByName.get(username);
   if (!row || !bcrypt.compareSync(password, row.password)) {
-    return res.status(401).json({ success: false, error: 'invalid credentials' });
+    return res.status(401).json({ error: 'invalid credentials' });
   }
-  const user = stmts.publicUser.get(row.id);
-  const token = newToken(user.id);
-  res.json({ success: true, token, user });
+  Q.setLastLogin.run(row.id);
+  const token = newSession(row.id);
+  const user = decoratePublicUser(Q.publicUser.get(row.id));
+  res.json({ token, user });
 });
 
-// --- UNITS ---
-app.get('/api/units', (_req, res) => {
-  res.json({ success: true, units: stmts.catalog.all() });
+app.post('/api/logout', requireAuth, (req, res) => {
+  const h = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  if (m) Q.deleteSession.run(m[1]);
+  res.json({ ok: true });
 });
 
-app.post('/api/units/buy', (req, res) => {
-  const { token, unitId } = req.body || {};
-  const user = authUser(token);
-  if (!user) return res.status(401).json({ success: false, error: 'not authenticated' });
-
-  const unit = stmts.catalogById.get(unitId);
-  if (!unit) return res.status(404).json({ success: false, error: 'unit not found' });
-
-  const ok = stmts.updateGold.run(unit.cost, user.id, unit.cost);
-  if (ok.changes === 0) return res.status(400).json({ success: false, error: 'not enough gold' });
-
-  stmts.addUserUnit.run(user.id, unit.id);
-  const updated = stmts.publicUser.get(user.id);
-  res.json({ success: true, user: updated, unit });
+// ─── Profile / Catalog / Season ────────────────────────────────────────────
+app.get('/api/profile', requireAuth, (req, res) => {
+  const u = decoratePublicUser(Q.publicUser.get(req.user.id));
+  const owned = Q.ownedUnits.all(req.user.id).map((r) => ({ ownedId: r.id, ...UNIT_BY_ID[r.unit_id] }));
+  const items = Q.ownedItems.all(req.user.id).map((r) => ({ ownedId: r.id, ...ITEM_BY_ID[r.item_id] }));
+  ensureDailyQuests(req.user.id);
+  const quests = Q.questsForDay.all(req.user.id, dayKey());
+  const loadouts = Q.loadouts.all(req.user.id).map((l) => ({ ...l, data: JSON.parse(l.data) }));
+  res.json({ user: u, units: owned, items, quests, loadouts });
 });
 
-app.get('/api/my-units', (req, res) => {
-  const token = req.query.token || req.headers['x-token'];
-  const user = authUser(token);
-  if (!user) return res.status(401).json({ success: false, error: 'not authenticated' });
-  res.json({ success: true, units: stmts.myUnits.all(user.id) });
+app.get('/api/catalog', (_req, res) => {
+  res.json({
+    units: UNITS, traits: TRAITS, items: ITEMS, augments: AUGMENTS,
+    board: BOARD, tiers: TIERS,
+  });
 });
 
-// --- LEADERBOARD ---
-function leaderboardHandler(_req, res) {
-  res.json({ success: true, players: stmts.leaderboard.all() });
-}
-app.get('/api/leaderboard', leaderboardHandler);
-app.post('/api/leaderboard', leaderboardHandler);
-
-// --- PROFILE ---
-app.post('/api/profile', (req, res) => {
-  const { token } = req.body || {};
-  const user = authUser(token);
-  if (!user) return res.status(401).json({ success: false, error: 'not authenticated' });
-  const pub = stmts.publicUser.get(user.id);
-  const owned = stmts.myUnits.all(user.id);
-  res.json({ success: true, user: pub, units: owned });
+app.get('/api/season', (_req, res) => {
+  const s = Q.currentSeason.get();
+  if (!s) return res.json({ season: null });
+  const remainingMs = (s.ends_at * 1000) - Date.now();
+  res.json({ season: { ...s, remainingMs: Math.max(0, remainingMs) } });
 });
 
-// ------------------------------------------------------------------
-// HTTP + WEBSOCKET SERVER
-// ------------------------------------------------------------------
+// ─── Shop ──────────────────────────────────────────────────────────────────
+app.post('/api/shop/buy-unit', shopLimiter, requireAuth, (req, res) => {
+  const { unitId } = req.body || {};
+  const unit = UNIT_BY_ID[unitId];
+  if (!unit) return res.status(404).json({ error: 'unit not found' });
+  const cost = unit.cost * 10;
+  const r = Q.spendGold.run(cost, req.user.id, cost);
+  if (r.changes === 0) return res.status(400).json({ error: 'not enough gold' });
+  Q.addUnit.run(req.user.id, unit.id);
+  res.json({ ok: true, user: decoratePublicUser(Q.publicUser.get(req.user.id)), unit });
+});
+
+app.post('/api/shop/buy-item', shopLimiter, requireAuth, (req, res) => {
+  const { itemId } = req.body || {};
+  const item = ITEM_BY_ID[itemId];
+  if (!item) return res.status(404).json({ error: 'item not found' });
+  const cost = item.cost * 15;
+  const r = Q.spendGold.run(cost, req.user.id, cost);
+  if (r.changes === 0) return res.status(400).json({ error: 'not enough gold' });
+  Q.addItem.run(req.user.id, item.id);
+  res.json({ ok: true, user: decoratePublicUser(Q.publicUser.get(req.user.id)), item });
+});
+
+// ─── Leaderboard / matches ─────────────────────────────────────────────────
+app.get('/api/leaderboard', (_req, res) => {
+  const players = Q.leaderboard.all().map((p) => {
+    const tier = tierOf(p.mmr);
+    return { ...p, tier: { name: tier.name, color: tier.color } };
+  });
+  res.json({ players });
+});
+
+app.get('/api/matches', requireAuth, (req, res) => {
+  res.json({ matches: Q.recentMatches.all(req.user.id, req.user.id) });
+});
+
+app.get('/api/matches/:id/replay', requireAuth, (req, res) => {
+  const row = Q.matchById.get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.player1_id !== req.user.id && row.player2_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  res.json({ match: row, replay: row.replay_data ? JSON.parse(row.replay_data) : null });
+});
+
+// Make a match's replay public — owner can call this to share a link.
+app.post('/api/matches/:id/share', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const r = Q.setMatchPublic.run(id, req.user.id, req.user.id);
+  if (r.changes === 0) return res.status(403).json({ error: 'not your match' });
+  const m = Q.matchById.get(id);
+  res.json({ ok: true, replayToken: m.replay_token });
+});
+
+// Public replay endpoint — no auth, only works for matches with public=1.
+app.get('/api/replays/:token', (req, res) => {
+  const m = Q.matchByToken.get(req.params.token);
+  if (!m || !m.public) return res.status(404).json({ error: 'not found' });
+  res.json({ match: m, replay: m.replay_data ? JSON.parse(m.replay_data) : null });
+});
+
+// ─── Quests ────────────────────────────────────────────────────────────────
+app.get('/api/quests', requireAuth, (req, res) => {
+  ensureDailyQuests(req.user.id);
+  res.json({ quests: Q.questsForDay.all(req.user.id, dayKey()) });
+});
+
+app.post('/api/quests/:id/claim', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const r = Q.claimQuest.run(id, req.user.id);
+  if (r.changes === 0) return res.status(400).json({ error: 'cannot claim' });
+  const q = Q.questById.get(id);
+  Q.addGold.run(q.reward_gold, req.user.id);
+  res.json({ ok: true, user: decoratePublicUser(Q.publicUser.get(req.user.id)), claimed: q });
+});
+
+// ─── Loadouts (server-side persistence as backup) ──────────────────────────
+app.post('/api/loadouts/:slot', requireAuth, (req, res) => {
+  const slot = Number(req.params.slot);
+  if (![1, 2, 3].includes(slot)) return res.status(400).json({ error: 'slot must be 1..3' });
+  const { name, board } = req.body || {};
+  if (!name || !Array.isArray(board)) return res.status(400).json({ error: 'name/board required' });
+  Q.upsertLoadout.run(req.user.id, slot, String(name).slice(0, 32), JSON.stringify(board));
+  res.json({ ok: true, loadouts: Q.loadouts.all(req.user.id).map((l) => ({ ...l, data: JSON.parse(l.data) })) });
+});
+
+app.delete('/api/loadouts/:slot', requireAuth, (req, res) => {
+  Q.delLoadout.run(req.user.id, Number(req.params.slot));
+  res.json({ ok: true });
+});
+
+// ─── Friends ───────────────────────────────────────────────────────────────
+app.get('/api/friends', requireAuth, (req, res) => {
+  const list = Q.myFriends.all(req.user.id);
+  const decorated = list.map((f) => {
+    const t = tierOf(f.mmr);
+    const onlineSocket = onlineUsers.get(f.id);
+    return { ...f, tier: { name: t.name, color: t.color }, online: !!onlineSocket };
+  });
+  const requests = Q.pendingFriendReqs.all(req.user.id);
+  res.json({ friends: decorated, requests });
+});
+
+app.post('/api/friends/request', requireAuth, (req, res) => {
+  const { friendCode } = req.body || {};
+  if (!friendCode) return res.status(400).json({ error: 'friendCode required' });
+  const target = Q.findUserByCode.get(String(friendCode).toUpperCase());
+  if (!target) return res.status(404).json({ error: 'no such code' });
+  if (target.id === req.user.id) return res.status(400).json({ error: 'cannot friend yourself' });
+  if (Q.isFriend.get(req.user.id, target.id)) return res.status(400).json({ error: 'already friends' });
+  if (Q.existingFriendReq.get(req.user.id, target.id)) return res.status(400).json({ error: 'request pending' });
+  Q.insertFriendReq.run(req.user.id, target.id);
+  // notify if online
+  pushToUser(target.id, { type: 'friend_request', from: { id: req.user.id, username: req.user.username } });
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/respond/:reqId', requireAuth, (req, res) => {
+  const reqId = Number(req.params.reqId);
+  const accept = !!(req.body && req.body.accept);
+  const fr = Q.friendReqById.get(reqId);
+  if (!fr || fr.to_id !== req.user.id || fr.status !== 'pending') return res.status(404).json({ error: 'not found' });
+  Q.setFriendReqStatus.run(accept ? 'accepted' : 'declined', reqId, req.user.id);
+  if (accept) {
+    Q.addFriend.run(req.user.id, fr.from_id);
+    Q.addFriend.run(fr.from_id, req.user.id);
+    pushToUser(fr.from_id, { type: 'friend_added', user: { id: req.user.id, username: req.user.username } });
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/remove/:friendId', requireAuth, (req, res) => {
+  const fid = Number(req.params.friendId);
+  Q.removeFriend.run(req.user.id, fid);
+  Q.removeFriend.run(fid, req.user.id);
+  res.json({ ok: true });
+});
+
+// ─── PvE: bot match ────────────────────────────────────────────────────────
+app.post('/api/play/bot', playLimiter, requireAuth, (req, res) => {
+  const { difficulty, board, augmentId } = req.body || {};
+  if (!BOT_TEAMS[difficulty]) return res.status(400).json({ error: 'unknown difficulty' });
+  const validation = validateUserBoard(req.user.id, board);
+  if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+  const myBoard = validation.board;
+  const botBoard = pickBotTeam(difficulty, myBoard);
+
+  // Resolve augment selection (optional, single)
+  const myAugs = augmentId && AUGMENT_BY_ID[augmentId] ? [AUGMENT_BY_ID[augmentId]] : [];
+
+  // Run simulation
+  const result = simulateBattle(myBoard, botBoard, { augments: { 1: myAugs, 2: [] } });
+
+  // Reward
+  const baseReward = result.winner === 1
+    ? REWARDS[`bot_${difficulty}`]
+    : { gold: 5, mmr: 0 };
+  const goldBonusFromAug = myAugs.reduce((acc, a) => acc + ((a.apply && a.apply.goldBonus) || 0), 0);
+  const reward = { ...baseReward, gold: baseReward.gold + goldBonusFromAug };
+
+  Q.addGold.run(reward.gold, req.user.id);
+  if (result.winner === 1) Q.bumpBotWin.run(req.user.id);
+
+  // Quests
+  bumpQuestSafely(req.user.id, 'play_3', 1);
+  if (result.winner === 1) {
+    bumpQuestSafely(req.user.id, 'win_2', 1);
+    if (difficulty === 'hard' || difficulty === 'nightmare') {
+      bumpQuestSafely(req.user.id, 'bot_hard', 1);
+    }
+  }
+  bumpQuestSafely(req.user.id, 'place_5', myBoard.length);
+  if (validation.upgrades > 0) bumpQuestSafely(req.user.id, 'star_up_1', validation.upgrades);
+  const skillCasts = result.ticks.flatMap((tk) => tk.fx).filter((fx) => fx.t === 'cast').length;
+  if (skillCasts > 0) bumpQuestSafely(req.user.id, 'use_skill', skillCasts);
+
+  // Persist match
+  const replayToken = uuidv4();
+  const replay = JSON.stringify({
+    team1: myBoard, team2: botBoard, ticks: result.ticks, traits: result.traits,
+    recap: result.recap, augments: { 1: myAugs.map((a) => a.id), 2: [] },
+    winner: result.winner, mode: 'pve', difficulty,
+  });
+  Q.insertMatch.run(req.user.id, null, difficulty, result.winner === 1 ? req.user.id : null, result.winner === 2 ? 1 : 0, replay, replayToken);
+
+  res.json({
+    winner: result.winner,
+    youWon: result.winner === 1,
+    reward,
+    user: decoratePublicUser(Q.publicUser.get(req.user.id)),
+    replay: {
+      team1: myBoard, team2: botBoard, ticks: result.ticks, traits: result.traits,
+      recap: result.recap, augments: { 1: myAugs.map((a) => a.id), 2: [] },
+      winner: result.winner,
+    },
+  });
+});
+
+// ─── HTTP + WebSocket ──────────────────────────────────────────────────────
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: '/ws' });
 
-// connection state
-const sockets = new Map(); // ws -> { userId, matchId }
-let queue = [];            // [{ ws, userId }]
-const matches = new Map(); // matchId -> match state
+const sockets = new Map();  // ws -> { userId, matchId, alive: bool }
+const onlineUsers = new Map(); // userId -> ws (last connection)
+let queue = [];             // [{ ws, userId }]
+const matches = new Map();  // matchId -> match state
+const pendingInvites = new Map(); // inviteId -> { from, to, createdAt }
 
-function send(ws, payload) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+function send(ws, obj) {
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function getOpponent(match, userId) {
-  return match.players.find((p) => p.userId !== userId);
+function broadcast(match, obj) {
+  for (const p of match.players) send(p.ws, obj);
 }
 
-// ------------------------------------------------------------------
-// BATTLE SIMULATION
-// ------------------------------------------------------------------
-// A board is an array of placed units: { catalogId, x, y } (x in 0..4, y in 0..1)
-// Internally, each combat unit gets:
-//   { uid, team, name, emoji, hp, maxHp, atk, baseAtk, speed, skill, x, y,
-//     alive, frozen, stunned, taunting, atkBuff, skillCd, hasRebirthed }
-
-function buildCombatants(board, team, takenUids) {
-  const out = [];
-  for (const slot of board) {
-    const c = stmts.catalogById.get(slot.catalogId);
-    if (!c) continue;
-    out.push({
-      uid: takenUids.next(),
-      team,
-      catalogId: c.id,
-      name: c.name,
-      emoji: c.emoji,
-      hp: c.hp,
-      maxHp: c.hp,
-      atk: c.attack,
-      baseAtk: c.attack,
-      speed: c.speed,
-      skillName: c.skill_name,
-      skillDamage: c.skill_damage,
-      x: slot.x | 0,
-      y: slot.y | 0,
-      alive: true,
-      frozen: 0,
-      stunned: 0,
-      atkBuff: 0,
-      skillCd: 0,        // 0 means ready
-      hasRebirthed: false,
-      tauntedBy: null,   // unit id forcing targeting
-    });
-  }
-  return out;
+function pushToUser(userId, obj) {
+  const ws = onlineUsers.get(userId);
+  if (ws) send(ws, obj);
 }
 
-function uidGen() {
-  let n = 0;
-  return { next: () => ++n };
-}
-
-function aliveEnemies(units, team) {
-  return units.filter((u) => u.alive && u.team !== team);
-}
-function aliveAllies(units, team) {
-  return units.filter((u) => u.alive && u.team === team);
-}
-
-// nearest = smallest manhattan distance, attackers from team A treat enemies as if mirrored
-function chooseTarget(self, units) {
-  const enemies = aliveEnemies(units, self.team);
-  if (enemies.length === 0) return null;
-  // Honor taunt: if any enemy is taunting, force-target it
-  const taunters = enemies.filter((e) => e.tauntActive);
-  if (taunters.length > 0) {
-    return taunters.sort((a, b) => dist(self, a) - dist(self, b))[0];
-  }
-  return enemies.sort((a, b) => dist(self, a) - dist(self, b))[0];
-}
-function dist(a, b) {
-  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
-}
-
-function dealDamage(attacker, target, amount, events, kind = 'attack') {
-  if (!target.alive) return;
-  const dmg = Math.max(0, Math.floor(amount));
-  target.hp -= dmg;
-  events.push({
-    kind,
-    from: attacker ? attacker.uid : null,
-    to: target.uid,
-    amount: dmg,
-    targetHp: Math.max(0, target.hp),
-  });
-  if (target.hp <= 0) {
-    // Phoenix Rebirth
-    if (target.name === 'Phoenix' && !target.hasRebirthed) {
-      target.hasRebirthed = true;
-      target.hp = Math.max(1, Math.floor(target.maxHp * 0.4));
-      events.push({ kind: 'rebirth', to: target.uid, hp: target.hp });
-      return;
-    }
-    target.alive = false;
-    target.hp = 0;
-    events.push({ kind: 'death', to: target.uid });
-  }
-}
-
-function useSkill(self, units, events) {
-  const team = self.team;
-  switch (self.name) {
-    case 'Dragon': {
-      // 3x damage to a row (target a row of enemies)
-      const enemies = aliveEnemies(units, team);
-      if (enemies.length === 0) break;
-      // Pick the row with most enemies
-      const rows = {};
-      for (const e of enemies) rows[e.y] = (rows[e.y] || 0) + 1;
-      const targetRow = Number(Object.keys(rows).sort((a, b) => rows[b] - rows[a])[0]);
-      const dmg = self.atk * 3;
-      events.push({ kind: 'skill', from: self.uid, name: 'Fire Breath' });
-      for (const e of enemies.filter((u) => u.y === targetRow)) {
-        dealDamage(self, e, dmg, events, 'skill_hit');
-      }
-      break;
-    }
-    case 'Knight': {
-      const t = chooseTarget(self, units);
-      if (!t) break;
-      events.push({ kind: 'skill', from: self.uid, name: 'Shield Bash', to: t.uid });
-      dealDamage(self, t, self.atk, events, 'skill_hit');
-      if (t.alive) t.stunned = Math.max(t.stunned, 1);
-      break;
-    }
-    case 'Mage': {
-      const enemies = aliveEnemies(units, team);
-      if (enemies.length === 0) break;
-      const t = enemies.sort((a, b) => a.hp - b.hp)[0];
-      events.push({ kind: 'skill', from: self.uid, name: 'Arcane Blast', to: t.uid });
-      dealDamage(self, t, self.atk * 2, events, 'skill_hit');
-      break;
-    }
-    case 'Assassin': {
-      const t = chooseTarget(self, units);
-      if (!t) break;
-      events.push({ kind: 'skill', from: self.uid, name: 'Backstab', to: t.uid });
-      dealDamage(self, t, self.atk * 3, events, 'skill_hit');
-      break;
-    }
-    case 'Healer': {
-      const allies = aliveAllies(units, team).filter((a) => a.hp < a.maxHp);
-      if (allies.length === 0) break;
-      const t = allies.sort((a, b) => a.hp - b.hp)[0];
-      const heal = 5;
-      t.hp = Math.min(t.maxHp, t.hp + heal);
-      events.push({ kind: 'heal', from: self.uid, to: t.uid, amount: heal, targetHp: t.hp });
-      break;
-    }
-    case 'Archer': {
-      const enemies = aliveEnemies(units, team);
-      if (enemies.length === 0) break;
-      events.push({ kind: 'skill', from: self.uid, name: 'Volley' });
-      const picks = [];
-      const pool = [...enemies];
-      for (let i = 0; i < 2 && pool.length > 0; i++) {
-        const idx = Math.floor(Math.random() * pool.length);
-        picks.push(pool.splice(idx, 1)[0]);
-      }
-      const dmg = Math.floor(self.atk * 0.7);
-      for (const p of picks) dealDamage(self, p, dmg, events, 'skill_hit');
-      break;
-    }
-    case 'Golem': {
-      events.push({ kind: 'skill', from: self.uid, name: 'Taunt' });
-      self.tauntActive = true;
-      self.tauntTtl = 1; // for 1 round
-      break;
-    }
-    case 'Necromancer': {
-      const dead = units.filter((u) => u.team === team && !u.alive);
-      if (dead.length === 0) break;
-      const t = dead[0];
-      t.alive = true;
-      t.hp = Math.max(1, Math.floor(t.maxHp * 0.5));
-      t.hasRebirthed = false;
-      events.push({ kind: 'revive', from: self.uid, to: t.uid, hp: t.hp });
-      break;
-    }
-    case 'Valkyrie': {
-      events.push({ kind: 'skill', from: self.uid, name: 'War Cry' });
-      for (const a of aliveAllies(units, team)) {
-        a.atk = a.baseAtk + 2 + a.atkBuff;
-        a.warCryTtl = 1;
-      }
-      break;
-    }
-    case 'Phoenix': {
-      // passive ability handled in dealDamage; active skill = strong attack
-      const t = chooseTarget(self, units);
-      if (!t) break;
-      events.push({ kind: 'skill', from: self.uid, name: 'Flame Strike', to: t.uid });
-      dealDamage(self, t, Math.floor(self.atk * 1.5), events, 'skill_hit');
-      break;
-    }
-    case 'IceWitch': {
-      const enemies = aliveEnemies(units, team);
-      if (enemies.length === 0) break;
-      const t = enemies[Math.floor(Math.random() * enemies.length)];
-      events.push({ kind: 'skill', from: self.uid, name: 'Freeze', to: t.uid });
-      t.frozen = 2;
-      break;
-    }
-    case 'StormLord': {
-      events.push({ kind: 'skill', from: self.uid, name: 'Storm' });
-      for (const e of aliveEnemies(units, team)) {
-        dealDamage(self, e, 3, events, 'skill_hit');
-      }
-      break;
-    }
-    default:
-      break;
-  }
-  self.skillCd = 2; // cooldown after use
-}
-
-function basicAttack(self, units, events) {
-  const t = chooseTarget(self, units);
-  if (!t) return;
-  events.push({ kind: 'attack', from: self.uid, to: t.uid });
-  dealDamage(self, t, self.atk, events, 'attack');
-}
-
-function endOfRoundCleanup(units) {
-  for (const u of units) {
-    if (u.tauntTtl > 0) {
-      u.tauntTtl -= 1;
-      if (u.tauntTtl === 0) u.tauntActive = false;
-    }
-    if (u.warCryTtl > 0) {
-      u.warCryTtl -= 1;
-      if (u.warCryTtl === 0) u.atk = u.baseAtk + u.atkBuff;
-    }
-    if (u.frozen > 0) u.frozen -= 1;
-    if (u.stunned > 0) u.stunned -= 1;
-    if (u.skillCd > 0) u.skillCd -= 1;
-  }
-}
-
-function teamAlive(units, team) {
-  return units.some((u) => u.team === team && u.alive);
-}
-
-function simulateBattle(board1, board2) {
-  const ids = uidGen();
-  const team1 = buildCombatants(board1, 1, ids);
-  const team2 = buildCombatants(board2, 2, ids);
-  const units = [...team1, ...team2];
-
-  const ticks = [];
-  // Initial snapshot
-  ticks.push({
-    tick: 0,
-    events: [{ kind: 'start' }],
-    state: snapshotUnits(units),
-  });
-
-  const MAX_ROUNDS = 30;
-  let round = 0;
-  while (round < MAX_ROUNDS && teamAlive(units, 1) && teamAlive(units, 2)) {
-    round += 1;
-    const events = [];
-    // act in speed order (descending), tiebreak by team alternation
-    const order = units
-      .filter((u) => u.alive)
-      .sort((a, b) => (b.speed - a.speed) || (a.team - b.team) || (a.uid - b.uid));
-
-    for (const u of order) {
-      if (!u.alive) continue;
-      if (u.frozen > 0) {
-        events.push({ kind: 'frozen', to: u.uid });
-        continue;
-      }
-      if (u.stunned > 0) {
-        events.push({ kind: 'stunned', to: u.uid });
-        continue;
-      }
-      if (!teamAlive(units, u.team === 1 ? 2 : 1)) break;
-
-      if (u.skillCd === 0) {
-        useSkill(u, units, events);
-      } else {
-        basicAttack(u, units, events);
-      }
-    }
-
-    endOfRoundCleanup(units);
-
-    ticks.push({
-      tick: round,
-      events,
-      state: snapshotUnits(units),
-    });
-  }
-
-  let winner = 0;
-  if (teamAlive(units, 1) && !teamAlive(units, 2)) winner = 1;
-  else if (teamAlive(units, 2) && !teamAlive(units, 1)) winner = 2;
-  else {
-    // tiebreak by total remaining HP
-    const hp1 = units.filter((u) => u.team === 1).reduce((s, u) => s + Math.max(0, u.hp), 0);
-    const hp2 = units.filter((u) => u.team === 2).reduce((s, u) => s + Math.max(0, u.hp), 0);
-    winner = hp1 >= hp2 ? 1 : 2;
-  }
-
-  return { ticks, winner, totalRounds: round };
-}
-
-function snapshotUnits(units) {
-  return units.map((u) => ({
-    uid: u.uid,
-    team: u.team,
-    name: u.name,
-    emoji: u.emoji,
-    hp: Math.max(0, u.hp),
-    maxHp: u.maxHp,
-    atk: u.atk,
-    x: u.x,
-    y: u.y,
-    alive: u.alive,
-    frozen: u.frozen,
-    stunned: u.stunned,
-  }));
-}
-
-// ------------------------------------------------------------------
-// MATCHMAKING
-// ------------------------------------------------------------------
 function tryMatch() {
   while (queue.length >= 2) {
-    const a = queue.shift();
-    const b = queue.shift();
+    const a = queue.shift(); const b = queue.shift();
     if (a.ws.readyState !== a.ws.OPEN) { queue.unshift(b); continue; }
     if (b.ws.readyState !== b.ws.OPEN) { queue.unshift(a); continue; }
+    if (a.userId === b.userId) { queue.unshift(b); queue.push(a); break; }
     createMatch(a, b);
   }
 }
 
-function createMatch(a, b) {
+function createMatch(a, b, isPrivate = false) {
   const matchId = uuidv4();
-  const userA = stmts.publicUser.get(a.userId);
-  const userB = stmts.publicUser.get(b.userId);
-
+  const ua = Q.publicUser.get(a.userId);
+  const ub = Q.publicUser.get(b.userId);
   const match = {
     id: matchId,
+    state: 'augment_select',
+    isPrivate,
+    augmentChoices: { 1: rollAugments(), 2: rollAugments() },
+    chosenAugment:  { 1: null, 2: null },
     players: [
-      { ws: a.ws, userId: a.userId, username: userA.username, board: null, ready: false },
-      { ws: b.ws, userId: b.userId, username: userB.username, board: null, ready: false },
+      { ws: a.ws, userId: a.userId, username: ua.username, mmr: ua.mmr, board: null, ready: false, gamesPlayed: ua.games_played || 0 },
+      { ws: b.ws, userId: b.userId, username: ub.username, mmr: ub.mmr, board: null, ready: false, gamesPlayed: ub.games_played || 0 },
     ],
-    state: 'placement',
+    placementDeadline: Date.now() + 60_000,
     createdAt: Date.now(),
   };
   matches.set(matchId, match);
-
   for (const p of match.players) {
-    const meta = sockets.get(p.ws);
-    if (meta) meta.matchId = matchId;
+    const meta = sockets.get(p.ws); if (meta) meta.matchId = matchId;
   }
-
+  // tell each player about their match + their unique augment options
   send(a.ws, {
-    type: 'match',
-    matchId,
-    opponent: { id: userB.id, username: userB.username, mmr: userB.mmr },
-    yourTurn: true,
+    type: 'match_found', matchId, side: 1,
+    opponent: { username: ub.username, mmr: ub.mmr, tier: tierOf(ub.mmr) },
+    deadline: match.placementDeadline,
+    augmentChoices: match.augmentChoices[1],
+    isPrivate,
   });
   send(b.ws, {
-    type: 'match',
-    matchId,
-    opponent: { id: userA.id, username: userA.username, mmr: userA.mmr },
-    yourTurn: true,
+    type: 'match_found', matchId, side: 2,
+    opponent: { username: ua.username, mmr: ua.mmr, tier: tierOf(ua.mmr) },
+    deadline: match.placementDeadline,
+    augmentChoices: match.augmentChoices[2],
+    isPrivate,
   });
+
+  // placement timeout
+  setTimeout(() => {
+    const m = matches.get(matchId);
+    if (!m || (m.state !== 'placement' && m.state !== 'augment_select' && m.state !== 'scout')) return;
+    const notReady = m.players.find((p) => !p.ready);
+    if (notReady) {
+      const opp = m.players.find((p) => p !== notReady);
+      // mark abandon
+      const today = dayKey();
+      Q.bumpAbandon.run(today, today, notReady.userId);
+      finishMatch(m, { winner: opp === m.players[0] ? 1 : 2, ticks: [], traits: { 1: { counts: {}, active: {} }, 2: { counts: {}, active: {} } }, recap: { 1: { units: [], mvpUid: null }, 2: { units: [], mvpUid: null } } }, true, notReady.userId);
+    } else {
+      runPvpBattle(m);
+    }
+  }, 65_000);
 }
 
-function validateBoard(units, userId) {
-  if (!Array.isArray(units) || units.length === 0 || units.length > 10) return false;
-  const seen = new Set();
-  for (const u of units) {
-    if (typeof u.catalogId !== 'number') return false;
-    if (typeof u.x !== 'number' || typeof u.y !== 'number') return false;
-    if (u.x < 0 || u.x > 4 || u.y < 0 || u.y > 1) return false;
-    const key = `${u.x},${u.y}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    if (!stmts.catalogById.get(u.catalogId)) return false;
+function maybeStartScout(match) {
+  // Once both players locked board, briefly send a "scout" snapshot of opponent comp
+  // before kicking off the battle. Scout phase = 4 seconds.
+  match.state = 'scout';
+  for (const p of match.players) {
+    const opp = match.players.find((x) => x !== p);
+    send(p.ws, {
+      type: 'scout',
+      opponent: {
+        username: opp.username,
+        board: opp.board.map((s) => ({ unitId: s.unitId, x: s.x, y: s.y, items: s.items, star: s.star || 1 })),
+      },
+      duration: 4000,
+    });
   }
-  return true;
+  setTimeout(() => {
+    if (matches.has(match.id) && match.state === 'scout') runPvpBattle(match);
+  }, 4000);
 }
 
-function startBattle(match) {
+function runPvpBattle(match) {
   match.state = 'battle';
-  const [p1, p2] = match.players;
-  const result = simulateBattle(p1.board, p2.board);
+  const p1 = match.players[0]; const p2 = match.players[1];
+  const aug1 = match.chosenAugment[1] ? [AUGMENT_BY_ID[match.chosenAugment[1]]].filter(Boolean) : [];
+  const aug2 = match.chosenAugment[2] ? [AUGMENT_BY_ID[match.chosenAugment[2]]].filter(Boolean) : [];
+  const result = simulateBattle(p1.board, p2.board, { augments: { 1: aug1, 2: aug2 } });
+  match._result = result;
 
-  // Stream ticks with small delays
+  const stepDelay = 1000 / TICKS_PER_SEC;
   let i = 0;
-  const stepDelay = 700;
-  const sendTick = () => {
-    if (i >= result.ticks.length) {
-      finishMatch(match, result);
-      return;
-    }
+  broadcast(match, { type: 'battle_start', traits: result.traits });
+  const send_next = () => {
+    if (!matches.has(match.id)) return;
+    if (i >= result.ticks.length) { finishMatch(match, result, false, null); return; }
     const tick = result.ticks[i++];
-    for (const p of match.players) {
-      send(p.ws, { type: 'battle_tick', matchId: match.id, tick: tick.tick, events: tick.events, state: tick.state });
-    }
-    setTimeout(sendTick, stepDelay);
+    broadcast(match, { type: 'tick', tick: tick.tick, fx: tick.fx, state: tick.state, info: tick.info });
+    setTimeout(send_next, stepDelay);
   };
-  sendTick();
+  send_next();
 }
 
-function finishMatch(match, result) {
-  const [p1, p2] = match.players;
+function finishMatch(match, result, walkover, abandonedBy) {
+  const p1 = match.players[0]; const p2 = match.players[1];
   const winnerPlayer = result.winner === 1 ? p1 : p2;
   const loserPlayer  = result.winner === 1 ? p2 : p1;
 
+  // Pull fresh user records for K-factor calc
+  const winFresh = Q.findUserById.get(winnerPlayer.userId);
+  const loseFresh = Q.findUserById.get(loserPlayer.userId);
+  const delta = eloDelta(winFresh.mmr, winFresh.games_played || 0, loseFresh.mmr, loseFresh.games_played || 0);
+
+  // Apply MMR + gold
+  Q.bumpGames.run(winnerPlayer.userId);
+  Q.bumpGames.run(loserPlayer.userId);
+  Q.applyMmr.run(delta.winnerDelta, delta.winnerDelta, winnerPlayer.userId);
+  Q.applyMmr.run(delta.loserDelta,  delta.loserDelta,  loserPlayer.userId);
+  Q.bumpWin.run(winnerPlayer.userId);
+  Q.bumpLoss.run(loserPlayer.userId);
+
+  // streak bonuses (read after bumpWin/bumpLoss so winstreak/losestreak reflect this game)
+  const winFresh2 = Q.findUserById.get(winnerPlayer.userId);
+  const loseFresh2 = Q.findUserById.get(loserPlayer.userId);
+  const winnerStreakBonus = streakBonus(winFresh2, true); // uses new winstreak
+  // Determine prev losestreak by checking pre-update record
+  const comebackWasTriggered = winFresh.losestreak >= 3;
+
+  // Augment goldBonus carries across (e.g. Coinpurse)
+  function augGoldFor(side) {
+    const augId = match.chosenAugment[side];
+    const a = augId ? AUGMENT_BY_ID[augId] : null;
+    return a && a.apply && a.apply.goldBonus ? a.apply.goldBonus : 0;
+  }
+  const winnerSide = result.winner;
+  const loserSide  = winnerSide === 1 ? 2 : 1;
+  const winnerGold = REWARDS.pvp_win.gold + winnerStreakBonus + augGoldFor(winnerSide);
+  const loserGold  = REWARDS.pvp_loss.gold + augGoldFor(loserSide);
+  Q.addGold.run(winnerGold, winnerPlayer.userId);
+  Q.addGold.run(loserGold,  loserPlayer.userId);
+
+  // Persist
+  const replayToken = uuidv4();
   const replay = JSON.stringify({
-    boards: { p1: p1.board, p2: p2.board },
-    ticks: result.ticks,
-    winner: result.winner,
-    rounds: result.totalRounds,
+    team1: p1.board || [], team2: p2.board || [],
+    ticks: result.ticks, traits: result.traits,
+    recap: result.recap || null,
+    augments: { 1: match.chosenAugment[1], 2: match.chosenAugment[2] },
+    winner: result.winner, walkover: !!walkover, mode: 'pvp',
   });
+  Q.insertMatch.run(p1.userId, p2.userId, null, winnerPlayer.userId, 0, replay, replayToken);
 
-  stmts.recordMatch.run(p1.userId, p2.userId, winnerPlayer.userId, replay);
-  stmts.applyWin.run(winnerPlayer.userId);
-  stmts.applyLoss.run(loserPlayer.userId);
-
+  // Quests
   for (const p of match.players) {
-    const updated = stmts.publicUser.get(p.userId);
+    bumpQuestSafely(p.userId, 'play_3', 1);
+    bumpQuestSafely(p.userId, 'place_5', (p.board || []).length);
+  }
+  bumpQuestSafely(winnerPlayer.userId, 'win_2', 1);
+  const skillCasts = result.ticks.flatMap((tk) => tk.fx || []).filter((fx) => fx.t === 'cast').length;
+  if (skillCasts > 0) {
+    for (const p of match.players) bumpQuestSafely(p.userId, 'use_skill', Math.ceil(skillCasts / 2));
+  }
+
+  // Send result
+  for (const p of match.players) {
+    const updated = decoratePublicUser(Q.publicUser.get(p.userId));
+    const isWinner = p === winnerPlayer;
     send(p.ws, {
       type: 'battle_end',
       matchId: match.id,
-      winner: winnerPlayer.userId,
-      youWon: p.userId === winnerPlayer.userId,
-      replayData: replay,
+      winner: result.winner,
+      youWon: isWinner,
+      walkover: !!walkover,
+      abandonedBy: abandonedBy || null,
+      reward: {
+        gold: isWinner ? winnerGold : loserGold,
+        mmr: isWinner ? delta.winnerDelta : delta.loserDelta,
+        streakBonus: isWinner ? winnerStreakBonus : 0,
+        comeback: isWinner ? comebackWasTriggered : false,
+      },
       user: updated,
+      recap: result.recap || null,
     });
-    const meta = sockets.get(p.ws);
-    if (meta) meta.matchId = null;
+    const meta = sockets.get(p.ws); if (meta) meta.matchId = null;
   }
-
   matches.delete(match.id);
 }
 
-// ------------------------------------------------------------------
-// WS HANDLERS
-// ------------------------------------------------------------------
+// ─── WS handlers ───────────────────────────────────────────────────────────
+const HEARTBEAT_INTERVAL_MS = 25_000;
+const HEARTBEAT_TIMEOUT_MS  = 60_000;
+
 wss.on('connection', (ws) => {
-  sockets.set(ws, { userId: null, matchId: null });
-  send(ws, { type: 'hello', msg: 'connected to Rift Realm' });
+  sockets.set(ws, { userId: null, matchId: null, alive: true, lastPong: Date.now() });
+  send(ws, { type: 'hello' });
+
+  ws.on('pong', () => {
+    const meta = sockets.get(ws);
+    if (meta) { meta.alive = true; meta.lastPong = Date.now(); }
+  });
 
   ws.on('message', (raw) => {
+    if (!wsAllow(ws)) return send(ws, { type: 'error', error: 'rate limited' });
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    handleMessage(ws, msg);
+    if (!msg || typeof msg !== 'object') return;
+
+    const meta = sockets.get(ws);
+    if (!meta) return;
+
+    if (msg.type === 'auth') {
+      const row = Q.findSession.get(msg.token || '');
+      if (!row) return send(ws, { type: 'error', error: 'invalid token' });
+      meta.userId = row.user_id;
+      onlineUsers.set(row.user_id, ws);
+      Q.setLastLogin.run(row.user_id);
+      const u = decoratePublicUser(Q.publicUser.get(row.user_id));
+      send(ws, { type: 'auth_ok', user: u });
+      // try rejoin if user was in a match
+      for (const m of matches.values()) {
+        const meIdx = m.players.findIndex((p) => p.userId === row.user_id);
+        if (meIdx >= 0) {
+          m.players[meIdx].ws = ws; meta.matchId = m.id;
+          send(ws, {
+            type: 'rejoin_match',
+            matchId: m.id, state: m.state,
+            side: meIdx + 1,
+          });
+          break;
+        }
+      }
+      return;
+    }
+
+    if (!meta.userId) return send(ws, { type: 'error', error: 'auth first' });
+
+    if (msg.type === 'queue_join') {
+      if (meta.matchId) return send(ws, { type: 'error', error: 'in match' });
+      if (queue.find((q) => q.userId === meta.userId)) return;
+      queue.push({ ws, userId: meta.userId });
+      send(ws, { type: 'queue_status', queued: true, size: queue.length });
+      tryMatch();
+      return;
+    }
+    if (msg.type === 'queue_leave') {
+      queue = queue.filter((q) => q.ws !== ws);
+      send(ws, { type: 'queue_status', queued: false, size: queue.length });
+      return;
+    }
+
+    if (msg.type === 'pick_augment') {
+      const m = matches.get(msg.matchId); if (!m) return;
+      if (m.state !== 'augment_select' && m.state !== 'placement') return;
+      const player = m.players.find((p) => p.userId === meta.userId);
+      if (!player) return;
+      const side = m.players.indexOf(player) === 0 ? 1 : 2;
+      const choices = m.augmentChoices[side] || [];
+      if (!choices.find((c) => c.id === msg.augmentId)) return send(ws, { type: 'error', error: 'invalid augment' });
+      m.chosenAugment[side] = msg.augmentId;
+      // Move to placement once augment is picked (each side independently)
+      if (m.state === 'augment_select') m.state = 'placement';
+      send(ws, { type: 'augment_ack', augmentId: msg.augmentId });
+      return;
+    }
+
+    if (msg.type === 'submit_board') {
+      const m = matches.get(msg.matchId);
+      if (!m) return send(ws, { type: 'error', error: 'no match' });
+      if (m.state !== 'placement' && m.state !== 'augment_select') return send(ws, { type: 'error', error: 'placement closed' });
+      const player = m.players.find((p) => p.userId === meta.userId);
+      if (!player) return;
+      const v = validateUserBoard(meta.userId, msg.board);
+      if (!v.ok) return send(ws, { type: 'error', error: v.error });
+      player.board = v.board;
+      player.ready = true;
+      send(ws, { type: 'board_ack', upgrades: v.upgrades });
+      const opp = m.players.find((p) => p !== player);
+      send(opp.ws, { type: 'opponent_ready' });
+      if (m.players.every((p) => p.ready)) maybeStartScout(m);
+      return;
+    }
+
+    if (msg.type === 'concede') {
+      if (!meta.matchId) return;
+      const m = matches.get(meta.matchId); if (!m) return;
+      const me = m.players.find((p) => p.userId === meta.userId);
+      const opp = m.players.find((p) => p !== me);
+      const today = dayKey();
+      Q.bumpAbandon.run(today, today, meta.userId);
+      finishMatch(m, {
+        winner: opp === m.players[0] ? 1 : 2, ticks: [],
+        traits: { 1: { counts: {}, active: {} }, 2: { counts: {}, active: {} } },
+        recap: { 1: { units: [], mvpUid: null }, 2: { units: [], mvpUid: null } },
+      }, true, meta.userId);
+      return;
+    }
+
+    // ─── Friend invite to private match ───
+    if (msg.type === 'invite_friend') {
+      const fid = Number(msg.friendId);
+      if (!Q.isFriend.get(meta.userId, fid)) return send(ws, { type: 'error', error: 'not friends' });
+      const friendWs = onlineUsers.get(fid);
+      if (!friendWs) return send(ws, { type: 'error', error: 'friend offline' });
+      const inviteId = uuidv4();
+      pendingInvites.set(inviteId, { from: meta.userId, to: fid, createdAt: Date.now() });
+      const me = Q.publicUser.get(meta.userId);
+      send(friendWs, { type: 'invite', inviteId, from: { id: me.id, username: me.username } });
+      send(ws, { type: 'invite_sent', inviteId });
+      // expire after 30s
+      setTimeout(() => pendingInvites.delete(inviteId), 30_000);
+      return;
+    }
+    if (msg.type === 'invite_respond') {
+      const inv = pendingInvites.get(msg.inviteId);
+      if (!inv) return send(ws, { type: 'error', error: 'invite expired' });
+      if (inv.to !== meta.userId) return;
+      pendingInvites.delete(msg.inviteId);
+      if (!msg.accept) {
+        const fromWs = onlineUsers.get(inv.from);
+        if (fromWs) send(fromWs, { type: 'invite_declined', inviteId: msg.inviteId });
+        return;
+      }
+      const fromWs = onlineUsers.get(inv.from);
+      if (!fromWs) return send(ws, { type: 'error', error: 'friend offline' });
+      // Both online — create private match
+      createMatch({ ws: fromWs, userId: inv.from }, { ws, userId: meta.userId }, true);
+      return;
+    }
+
+    if (msg.type === 'ping') {
+      send(ws, { type: 'pong', t: Date.now() });
+      return;
+    }
+
+    send(ws, { type: 'error', error: `unknown type: ${msg.type}` });
   });
 
   ws.on('close', () => {
     const meta = sockets.get(ws);
-    if (meta) {
-      // remove from queue
-      queue = queue.filter((q) => q.ws !== ws);
-      // if in a match, the other player wins by walkover
-      if (meta.matchId && matches.has(meta.matchId)) {
-        const match = matches.get(meta.matchId);
-        if (match.state === 'placement' || match.state === 'battle') {
-          const opp = match.players.find((p) => p.ws !== ws);
-          if (opp) {
-            stmts.recordMatch.run(match.players[0].userId, match.players[1].userId, opp.userId, JSON.stringify({ walkover: true }));
-            stmts.applyWin.run(opp.userId);
-            stmts.applyLoss.run(meta.userId);
-            const updated = stmts.publicUser.get(opp.userId);
-            send(opp.ws, {
-              type: 'battle_end',
-              matchId: match.id,
-              winner: opp.userId,
-              youWon: true,
-              walkover: true,
-              user: updated,
-            });
+    if (!meta) return;
+    queue = queue.filter((q) => q.ws !== ws);
+    if (meta.userId && onlineUsers.get(meta.userId) === ws) {
+      onlineUsers.delete(meta.userId);
+    }
+    if (meta.matchId && matches.has(meta.matchId)) {
+      const m = matches.get(meta.matchId);
+      // Don't immediately abandon — give 8s grace for reconnect.
+      const me = m.players.find((p) => p.ws === ws);
+      if (me) me.ws = null;
+      const allDisconnected = m.players.every((p) => !p.ws || p.ws.readyState !== p.ws.OPEN);
+      if (allDisconnected) {
+        // both gone, drop the match
+        matches.delete(m.id);
+      } else if (m.state === 'placement' || m.state === 'augment_select' || m.state === 'scout') {
+        // give a small grace window
+        setTimeout(() => {
+          const m2 = matches.get(meta.matchId); if (!m2) return;
+          const meStill = m2.players.find((p) => p.userId === meta.userId);
+          if (meStill && (!meStill.ws || meStill.ws.readyState !== meStill.ws.OPEN)) {
+            const opp = m2.players.find((p) => p !== meStill);
+            const today = dayKey();
+            if (meStill.userId) Q.bumpAbandon.run(today, today, meStill.userId);
+            finishMatch(m2, {
+              winner: opp === m2.players[0] ? 1 : 2, ticks: [],
+              traits: { 1: { counts: {}, active: {} }, 2: { counts: {}, active: {} } },
+              recap: { 1: { units: [], mvpUid: null }, 2: { units: [], mvpUid: null } },
+            }, true, meta.userId);
           }
-          matches.delete(match.id);
-        }
+        }, 8000);
       }
+      // If in battle we still let the simulation finish — both sides receive the stream regardless.
     }
     sockets.delete(ws);
   });
 });
 
-function handleMessage(ws, msg) {
-  if (!msg || typeof msg !== 'object') return;
-
-  if (msg.type === 'auth') {
-    const user = authUser(msg.token);
-    if (!user) return send(ws, { type: 'error', error: 'invalid token' });
-    sockets.get(ws).userId = user.id;
-    send(ws, { type: 'auth_ok', user: stmts.publicUser.get(user.id) });
-    return;
-  }
-
-  const meta = sockets.get(ws);
-  if (!meta || !meta.userId) {
-    // allow auth via embedded token for convenience
-    if (msg.token) {
-      const user = authUser(msg.token);
-      if (user) {
-        meta.userId = user.id;
-      } else {
-        return send(ws, { type: 'error', error: 'not authenticated' });
-      }
-    } else {
-      return send(ws, { type: 'error', error: 'not authenticated' });
+// Heartbeat: ping every interval; drop dead sockets.
+setInterval(() => {
+  for (const ws of wss.clients) {
+    const meta = sockets.get(ws); if (!meta) continue;
+    if (Date.now() - meta.lastPong > HEARTBEAT_TIMEOUT_MS) {
+      try { ws.terminate(); } catch (_) {}
+      continue;
     }
+    meta.alive = false;
+    try { ws.ping(); } catch (_) {}
   }
+}, HEARTBEAT_INTERVAL_MS).unref?.();
 
-  if (msg.type === 'queue') {
-    if (msg.action === 'join') {
-      // ignore if already queued or in match
-      if (meta.matchId) return send(ws, { type: 'error', error: 'already in a match' });
-      if (queue.find((q) => q.ws === ws)) return;
-      queue.push({ ws, userId: meta.userId });
-      send(ws, { type: 'queue_status', queued: true, size: queue.length });
-      tryMatch();
-    } else if (msg.action === 'leave') {
-      queue = queue.filter((q) => q.ws !== ws);
-      send(ws, { type: 'queue_status', queued: false, size: queue.length });
-    }
-    return;
-  }
-
-  if (msg.type === 'board') {
-    const match = matches.get(msg.matchId);
-    if (!match) return send(ws, { type: 'error', error: 'match not found' });
-    if (match.state !== 'placement') return send(ws, { type: 'error', error: 'placement closed' });
-    const player = match.players.find((p) => p.userId === meta.userId);
-    if (!player) return send(ws, { type: 'error', error: 'not in this match' });
-    if (!validateBoard(msg.units, meta.userId)) return send(ws, { type: 'error', error: 'invalid board' });
-
-    player.board = msg.units;
-    player.ready = true;
-    send(ws, { type: 'board_ack', matchId: match.id });
-
-    const opponent = getOpponent(match, meta.userId);
-    if (opponent) send(opponent.ws, { type: 'opponent_ready', matchId: match.id });
-
-    if (match.players.every((p) => p.ready)) {
-      startBattle(match);
-    }
-    return;
-  }
-
-  if (msg.type === 'ping') {
-    send(ws, { type: 'pong', t: Date.now() });
-    return;
-  }
-
-  send(ws, { type: 'error', error: 'unknown message type' });
-}
-
-// ------------------------------------------------------------------
-// START
-// ------------------------------------------------------------------
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`[rift-realm] HTTP + WS listening on :${PORT}`);
+  console.log(`[rift-realm] listening on :${PORT} (HTTP + WS@/ws)`);
 });
+
+module.exports = { app, server };
