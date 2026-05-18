@@ -1,157 +1,50 @@
-// /root/rift-realm/client/src/components/BattleLog.jsx
+// /client/src/components/BattleLog.jsx
+import React, { useEffect, useRef } from "react";
 
-import React, { useEffect, useRef, useState } from "react";
-
-function EventLine({ event, isNew }) {
-  const { actor, action, target, damage, healed } = event;
-
-  let color = "#d1d5db";
-  let icon = "•";
-  let text = "";
-
-  if (action === "attack" || damage > 0) {
-    color = "#fca5a5";
-    icon = "⚔";
-    text = `${actor} attacks ${target} for ${damage} dmg`;
-  } else if (action === "heal" || healed > 0) {
-    color = "#86efac";
-    icon = "✦";
-    text = `${actor} heals ${target} for ${healed}`;
-  } else if (action === "skill") {
-    color = "#c4b5fd";
-    icon = "✸";
-    text = `${actor} uses skill on ${target}${damage ? ` (${damage} dmg)` : ""}${healed ? ` (+${healed} hp)` : ""}`;
-  } else if (action === "death") {
-    color = "#9ca3af";
-    icon = "💀";
-    text = `${actor} is defeated`;
-  } else {
-    text = `${actor} ${action}${target ? ` → ${target}` : ""}`;
+function lineFor(ev, units) {
+  const lookup = (uid) => {
+    const u = units.find((x) => x.uid === uid);
+    return u ? `${u.emoji} ${u.name}` : `unit#${uid}`;
+  };
+  switch (ev.t) {
+    case "atk":  return { color: "#fbbf24", text: `${lookup(ev.uid)} attacks ${lookup(ev.target)}${ev.crit ? " (CRIT!)" : ""}` };
+    case "dmg":  return null; // already implied by atk/cast
+    case "cast": return { color: "#a78bfa", text: `${lookup(ev.uid)} casts ${ev.name}` };
+    case "heal": return { color: "#22c55e", text: `${lookup(ev.uid)} healed +${ev.amount}` };
+    case "death":return { color: "#9ca3af", text: `${lookup(ev.uid)} is defeated` };
+    case "revive":return { color: "#fbbf24", text: `${lookup(ev.uid)} returns to battle!` };
+    case "summon":return { color: "#22d3ee", text: `Side ${ev.team} summons ${ev.name}` };
+    case "stunned":return { color: "#94a3b8", text: `${lookup(ev.uid)} stunned` };
+    case "frozen": return { color: "#60a5fa", text: `${lookup(ev.uid)} frozen` };
+    default: return null;
   }
-
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "flex-start",
-        gap: "6px",
-        padding: "2px 0",
-        color,
-        fontSize: "12px",
-        animation: isNew ? "fadeSlideIn 0.3s ease forwards" : "none",
-        opacity: isNew ? 0 : 1,
-      }}
-    >
-      <span style={{ flexShrink: 0, fontSize: "11px" }}>{icon}</span>
-      <span>{text}</span>
-    </div>
-  );
 }
 
-function TickBlock({ tick, events, isLatest }) {
-  return (
-    <div
-      style={{
-        marginBottom: "8px",
-        borderLeft: `2px solid ${isLatest ? "#7c3aed" : "#374151"}`,
-        paddingLeft: "8px",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "10px",
-          color: isLatest ? "#a78bfa" : "#6b7280",
-          fontWeight: "bold",
-          marginBottom: "3px",
-          letterSpacing: "1px",
-        }}
-      >
-        TICK {tick}
-      </div>
-      {events.map((ev, i) => (
-        <EventLine key={i} event={ev} isNew={isLatest} />
-      ))}
-    </div>
-  );
-}
-
-export default function BattleLog({ log = [] }) {
+export default function BattleLog({ ticks = [], units = [] }) {
   const bottomRef = useRef(null);
-  const [prevLen, setPrevLen] = useState(0);
-
   useEffect(() => {
-    if (bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: "smooth" });
-    }
-    setPrevLen(log.length);
-  }, [log]);
+    if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [ticks]);
 
   return (
-    <div
-      style={{
-        background: "rgba(10, 7, 20, 0.85)",
-        border: "1px solid #374151",
-        borderRadius: "10px",
-        padding: "12px",
-        height: "100%",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "12px",
-          fontWeight: "bold",
-          color: "#a78bfa",
-          letterSpacing: "2px",
-          textTransform: "uppercase",
-          marginBottom: "10px",
-          borderBottom: "1px solid #374151",
-          paddingBottom: "6px",
-          flexShrink: 0,
-        }}
-      >
-        📜 Battle Log
-      </div>
-
-      <div
-        style={{
-          overflowY: "auto",
-          flex: 1,
-          paddingRight: "4px",
-          scrollbarWidth: "thin",
-          scrollbarColor: "#4c1d95 transparent",
-        }}
-      >
-        <style>{`
-          @keyframes fadeSlideIn {
-            from { opacity: 0; transform: translateX(-6px); }
-            to   { opacity: 1; transform: translateX(0); }
-          }
-        `}</style>
-
-        {log.length === 0 && (
-          <div
-            style={{
-              color: "#4b5563",
-              fontSize: "12px",
-              textAlign: "center",
-              marginTop: "20px",
-            }}
-          >
-            Awaiting battle...
-          </div>
+    <div className="battle-log">
+      <div className="battle-log-title">📜 Battle Log</div>
+      <div className="battle-log-body">
+        {ticks.length === 0 && (
+          <div className="battle-log-empty">Awaiting combat…</div>
         )}
-
-        {log.map((entry, idx) => (
-          <TickBlock
-            key={entry.tick ?? idx}
-            tick={entry.tick ?? idx + 1}
-            events={entry.events ?? []}
-            isLatest={idx >= prevLen - 1}
-          />
-        ))}
+        {ticks.map((t, i) => {
+          const lines = (t.fx || []).map((ev) => lineFor(ev, units)).filter(Boolean);
+          if (lines.length === 0) return null;
+          return (
+            <div key={i} className="tick-block">
+              <div className="tick-label">tick {t.tick}</div>
+              {lines.map((l, j) => (
+                <div key={j} className="tick-line" style={{ color: l.color }}>{l.text}</div>
+              ))}
+            </div>
+          );
+        })}
         <div ref={bottomRef} />
       </div>
     </div>
