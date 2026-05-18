@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.db
+.env
+server_output.txt
+kiro_response.json
+client_response.json
+/tmp/
